@@ -1,0 +1,264 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0055A4">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
+    <meta name="apple-mobile-web-app-title" content="BusTimes">
+    <link rel="manifest" href="/static/manifest.json">
+    <title>附近公交 - 布里斯班</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🚌 附近公交</h1>
+        </header>
+
+        <main>
+            <!-- Secondary: search by route number (top) -->
+            <div class="search-section" style="margin-bottom:20px;">
+                <label class="search-label" style="font-size:18px;">🔍 按线路号查询：</label>
+                <div class="search-box">
+                    <input type="text" id="route-search" class="search-input"
+                           placeholder="例如：414" autocomplete="off"
+                           inputmode="numeric" pattern="[0-9]*">
+                    <button type="button" id="route-search-btn" class="search-button" disabled>查询</button>
+                </div>
+                <div id="route-results" class="stop-results-list"></div>
+            </div>
+
+            <!-- Data still loading at startup -->
+            <div id="loading-banner" class="data-loading-banner" style="display:none;">
+                ⏳ 正在加载数据，请稍候…
+            </div>
+
+            <!-- Detecting location / fetching -->
+            <section id="detecting-section">
+                <p class="loading-text" id="detecting-text">📍 正在获取您的位置…</p>
+            </section>
+
+            <!-- Nearby routes list -->
+            <section id="results-section" style="display:none;">
+                <p id="results-subtitle" style="font-size:16px;color:#666;margin-bottom:14px;"></p>
+                <div id="routes-list"></div>
+                <button id="refresh-btn" class="search-button" style="width:100%;margin-top:8px;">
+                    🔄 刷新
+                </button>
+            </section>
+
+            <!-- Error -->
+            <section id="error-section" style="display:none;">
+                <p class="error-message" id="error-text"></p>
+                <button type="button" class="search-button" onclick="location.reload()" style="margin-top:20px;">
+                    重新查询
+                </button>
+            </section>
+
+            <!-- Manual stop-search fallback (geolocation unavailable) -->
+            <section id="stop-search-section" style="display:none;">
+                <div class="search-section">
+                    <label class="search-label">📍 请输入您附近的站点或区域：</label>
+                    <div class="search-box">
+                        <input type="text" id="stop-search-input" class="search-input"
+                               placeholder="例如：Indooroopilly" autocomplete="off">
+                        <button type="button" id="stop-search-btn" class="search-button">查找</button>
+                    </div>
+                    <div id="stop-results" class="stop-results-list"></div>
+                </div>
+            </section>
+
+        </main>
+
+        <footer>
+            <p>数据由 TransLink 提供</p>
+        </footer>
+    </div>
+
+    <script>
+        const detectingSection  = document.getElementById('detecting-section');
+        const detectingText     = document.getElementById('detecting-text');
+        const resultsSection    = document.getElementById('results-section');
+        const resultsSubtitle   = document.getElementById('results-subtitle');
+        const routesList        = document.getElementById('routes-list');
+        const errorSection      = document.getElementById('error-section');
+        const stopSearchSection = document.getElementById('stop-search-section');
+        const stopSearchInput   = document.getElementById('stop-search-input');
+        const stopSearchBtn     = document.getElementById('stop-search-btn');
+        const loadingBanner     = document.getElementById('loading-banner');
+        const refreshBtn        = document.getElementById('refresh-btn');
+        const routeSearchBtn    = document.getElementById('route-search-btn');
+        const routeSearchInput  = document.getElementById('route-search');
+
+        let savedLat = null, savedLon = null;
+
+        // ── Wait for GTFS data to finish loading ─────────────────
+        (function checkReady() {
+            fetch('/status')
+                .then(r => r.json())
+                .then(data => {
+                    if (data.ready) {
+                        loadingBanner.style.display = 'none';
+                        routeSearchBtn.disabled = false;
+                        startLocationDetection();
+                    } else {
+                        loadingBanner.style.display = 'block';
+                        detectingSection.style.display = 'none';
+                        routeSearchBtn.disabled = true;
+                        setTimeout(checkReady, 1500);
+                    }
+                })
+                .catch(() => setTimeout(checkReady, 2000));
+        })();
+
+        // ── Location → nearby routes ──────────────────────────────
+        function startLocationDetection() {
+            detectingSection.style.display = 'block';
+            detectingText.textContent = '📍 正在获取您的位置…';
+
+            if ('geolocation' in navigator && window.isSecureContext) {
+                navigator.geolocation.getCurrentPosition(
+                    pos => {
+                        savedLat = pos.coords.latitude;
+                        savedLon = pos.coords.longitude;
+                        fetchNearbyRoutes(savedLat, savedLon);
+                    },
+                    () => showStopSearchFallback(),
+                    { timeout: 8000 }
+                );
+            } else {
+                showStopSearchFallback();
+            }
+        }
+
+        function fetchNearbyRoutes(lat, lon) {
+            detectingSection.style.display = 'block';
+            detectingText.textContent = '🚌 正在搜索附近路线…';
+            resultsSection.style.display = 'none';
+
+            fetch(`/nearby_routes?lat=${lat}&lon=${lon}&radius=500`)
+                .then(r => r.json())
+                .then(data => {
+                    detectingSection.style.display = 'none';
+                    renderRoutes(data.routes || []);
+                })
+                .catch(() => {
+                    detectingSection.style.display = 'none';
+                    showError('获取附近路线失败，请重试');
+                });
+        }
+
+        function renderRoutes(routes) {
+            resultsSection.style.display = 'block';
+            if (routes.length === 0) {
+                resultsSubtitle.textContent = '附近1公里内没有找到公交线路。';
+                routesList.innerHTML = '';
+                return;
+            }
+            resultsSubtitle.textContent = `找到 ${routes.length} 条附近路线（500米范围内）`;
+            routesList.innerHTML = routes.map(r => {
+                const hasTime = !!r.next_departure;
+                const time    = r.next_departure || '今日无班次';
+                const dist    = r.distance_m < 1000
+                    ? `${r.distance_m}m`
+                    : `${(r.distance_m / 1000).toFixed(1)}km`;
+                const dirParam = r.next_headsign
+                    ? `&direction=${encodeURIComponent(r.next_headsign)}` : '';
+                return `
+                    <a href="/direction?route_id=${encodeURIComponent(r.route_id)}${dirParam}&stop_id=${encodeURIComponent(r.nearest_stop_id)}"
+                       class="nearby-route-card">
+                        <div class="nearby-route-number">${escapeHtml(r.route_short_name)}</div>
+                        <div class="nearby-route-info">
+                            <div class="nearby-route-name">${escapeHtml(r.route_long_name)}</div>
+                            <div class="nearby-route-stop">📍 ${escapeHtml(r.nearest_stop_name)} · ${dist}</div>
+                            ${r.next_headsign
+                                ? `<div class="nearby-route-headsign">→ ${escapeHtml(r.next_headsign)}</div>`
+                                : ''}
+                        </div>
+                        <div class="nearby-route-time${hasTime ? '' : ' no-service'}">${escapeHtml(time)}</div>
+                    </a>`;
+            }).join('');
+        }
+
+        refreshBtn.addEventListener('click', () => {
+            if (savedLat !== null) fetchNearbyRoutes(savedLat, savedLon);
+            else startLocationDetection();
+        });
+
+        // ── Manual stop-search fallback ───────────────────────────
+        function showStopSearchFallback() {
+            detectingSection.style.display = 'none';
+            stopSearchSection.style.display = 'block';
+            stopSearchInput.focus();
+        }
+
+        stopSearchBtn.addEventListener('click', doStopSearch);
+        stopSearchInput.addEventListener('keypress', e => { if (e.key === 'Enter') doStopSearch(); });
+
+        function doStopSearch() {
+            const q = stopSearchInput.value.trim();
+            if (!q) return;
+            fetch('/search_stops?q=' + encodeURIComponent(q))
+                .then(r => r.json())
+                .then(stops => {
+                    const list = document.getElementById('stop-results');
+                    if (stops.length === 0) {
+                        list.innerHTML = '<p style="color:#666;padding:8px;">未找到站点，请换个关键词</p>';
+                        return;
+                    }
+                    list.innerHTML = stops.map(s =>
+                        `<button class="stop-result-item"
+                             onclick="useStop(${parseFloat(s.stop_lat) || 0}, ${parseFloat(s.stop_lon) || 0})"
+                         >${escapeHtml(s.stop_name)}</button>`
+                    ).join('');
+                });
+        }
+
+        function useStop(lat, lon) {
+            savedLat = lat; savedLon = lon;
+            stopSearchSection.style.display = 'none';
+            fetchNearbyRoutes(lat, lon);
+        }
+
+        // ── Secondary: search by route number ────────────────────
+        routeSearchBtn.addEventListener('click', doRouteSearch);
+        routeSearchInput.addEventListener('keypress', e => { if (e.key === 'Enter') doRouteSearch(); });
+
+        function doRouteSearch() {
+            const q = routeSearchInput.value.trim();
+            if (!q) return;
+            fetch('/search_routes?q=' + encodeURIComponent(q))
+                .then(r => r.json())
+                .then(routes => {
+                    const list = document.getElementById('route-results');
+                    if (routes.length === 0) {
+                        list.innerHTML = '<p style="color:#666;padding:8px;">未找到路线</p>';
+                        return;
+                    }
+                    list.innerHTML = routes.map(r =>
+                        `<a href="/route/${encodeURIComponent(r.route_id)}"
+                            class="stop-result-item" style="display:block;text-decoration:none;">
+                             <strong>${escapeHtml(r.route_short_name)}</strong>
+                             &nbsp;${escapeHtml(r.route_long_name)}
+                         </a>`
+                    ).join('');
+                });
+        }
+
+        // ── Helpers ───────────────────────────────────────────────
+        function showError(msg) {
+            detectingSection.style.display = 'none';
+            errorSection.style.display = 'block';
+            document.getElementById('error-text').textContent = msg;
+        }
+
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = String(text);
+            return d.innerHTML;
+        }
+    </script>
+</body>
+</html>

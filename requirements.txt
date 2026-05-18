@@ -1,0 +1,14 @@
+# requirements.txt
+# -----------------
+# Runtime dependencies for the Brisbane TransLink Bus Lookup app.
+#
+# The core GTFS parsing uses only the Python standard library (csv, zipfile, urllib, etc.).
+# The web interface requires Flask.
+#
+# Python 3.10+ is required (uses the X | Y union type hint syntax).
+#
+# To verify your Python version:
+#   python --version
+
+flask>=2.3.0
+gunicorn>=21.2.0

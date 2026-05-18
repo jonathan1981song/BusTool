@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0055A4">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="/static/manifest.json">
+    <title>{{ route.route_short_name }}路 下一班车 - 布里斯班公交车时刻表</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <a href="/route/{{ route.route_id }}" class="back-link">← 返回线路</a>
+        </header>
+
+        <main>
+            <section class="route-info-card">
+                <div class="route-header">
+                    <div class="route-number">{{ route.route_short_name }}</div>
+                    <div class="route-header-info">
+                        <h2>{{ route.route_long_name }}</h2>
+                    </div>
+                </div>
+            </section>
+
+            <section class="timetable-section" style="text-align: center;">
+                <h2>🕐 下一班车</h2>
+                
+                {% if direction %}
+                    <p style="font-size: 20px; color: #0055A4; margin-bottom: 20px; font-weight: 600;">
+                        方向：{{ direction }}
+                    </p>
+                {% endif %}
+
+                {% if departures %}
+                    <div class="next-bus-list">
+                        {% for dep in departures %}
+                        <div class="next-bus-item">
+                            <div class="next-bus-time">{{ dep.departure }}</div>
+                            <div class="next-bus-info">
+                                <div class="next-bus-stop">{{ dep.stop_name }}</div>
+                                <div class="next-bus-headsign">方向：{{ dep.headsign }}</div>
+                            </div>
+                        </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <div style="padding: 40px 0;">
+                        <p class="no-results" style="font-size: 22px; margin-bottom: 20px;">
+                            {% if direction %}
+                                今天当前时间后，暂无开往"{{ direction }}"方向的公交车。
+                            {% else %}
+                                今天当前时间后，暂无该线路的公交车。
+                            {% endif %}
+                        </p>
+                        <p style="font-size: 18px; color: #666; margin-bottom: 24px;">
+                            可能的原因：服务已结束、方向不匹配、或今天（{{ today }}）不运营。
+                        </p>
+                    </div>
+                {% endif %}
+            </section>
+
+            <section class="timetable-section">
+                <h2>查看完整时刻表</h2>
+                <p style="font-size: 18px; color: #666; margin-bottom: 16px;">
+                    查看该线路全天的时刻表。
+                </p>
+                <div style="display: flex; gap: 12px; flex-wrap: wrap;">
+                    <a href="/timetable?route_id={{ route.route_id }}&day=weekday" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center;">
+                        工作日
+                    </a>
+                    <a href="/timetable?route_id={{ route.route_id }}&day=saturday" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center; background: #F37021;">
+                        周六
+                    </a>
+                    <a href="/timetable?route_id={{ route.route_id }}&day=sunday" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center; background: #28A745;">
+                        周日
+                    </a>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>数据由 TransLink 昆士兰东南部提供</p>
+        </footer>
+    </div>
+
+    <style>
+        .next-bus-list {
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .next-bus-item {
+            display: flex;
+            align-items: center;
+            gap: 16px;
+            padding: 16px;
+            background: #E6F0FF;
+            border-radius: 12px;
+            border-left: 4px solid #0055A4;
+        }
+
+        .next-bus-time {
+            font-size: 32px;
+            font-weight: 700;
+            color: #0055A4;
+            min-width: 100px;
+            text-align: center;
+        }
+
+        .next-bus-info {
+            flex: 1;
+        }
+
+        .next-bus-stop {
+            font-size: 20px;
+            font-weight: 600;
+            color: #1A1A1A;
+            margin-bottom: 4px;
+        }
+
+        .next-bus-headsign {
+            font-size: 16px;
+            color: #666666;
+        }
+    </style>
+</body>
+</html>
