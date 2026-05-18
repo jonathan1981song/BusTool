@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0055A4">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <link rel="manifest" href="/static/manifest.json">
+    <title>{{ route.route_short_name }}路时刻表 - 布里斯班公交车时刻表</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <a href="/route/{{ route.route_id }}" class="back-link">← 返回线路</a>
+        </header>
+
+        <main>
+            <section class="route-info-card">
+                <div class="route-header">
+                    <div class="route-number">{{ route.route_short_name }}</div>
+                    <div class="route-header-info">
+                        <h2>{{ route.route_long_name }}</h2>
+                    </div>
+                </div>
+            </section>
+
+            <section class="timetable-section">
+                <div class="timetable-header">
+                    <h2>{{ day_type|replace('weekday', '工作日')|replace('saturday', '周六')|replace('sunday', '周日') }}时刻表</h2>
+                    {% if stop_name %}
+                    <p style="font-size: 18px; color: #555; margin-top: 8px;">📍 {{ stop_name }}</p>
+                    {% endif %}
+                </div>
+
+                <div class="day-selector">
+                    <a href="/timetable?route_id={{ route.route_id }}&day=weekday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="day-btn {% if day_type == 'weekday' %}active{% endif %}">
+                        工作日
+                    </a>
+                    <a href="/timetable?route_id={{ route.route_id }}&day=saturday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="day-btn {% if day_type == 'saturday' %}active{% endif %}">
+                        周六
+                    </a>
+                    <a href="/timetable?route_id={{ route.route_id }}&day=sunday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="day-btn {% if day_type == 'sunday' %}active{% endif %}">
+                        周日
+                    </a>
+                </div>
+
+                {% if timetable %}
+                    <div class="timetable-content">
+                        {% for entry in timetable %}
+                            <div class="timetable-stop">
+                                <h3>{{ entry.stop_name }}</h3>
+                                <p class="headsign">方向：{{ entry.headsign }}</p>
+                                <div class="time-list">
+                                    {% for t in entry.times %}
+                                        <span class="time-badge">{{ t[:5] }}</span>
+                                    {% endfor %}
+                                </div>
+                            </div>
+                        {% endfor %}
+                    </div>
+                {% else %}
+                    <p class="no-results">{{ day_type|replace('weekday', '工作日')|replace('saturday', '周六')|replace('sunday', '周日') }}暂无时刻表数据。</p>
+                    <p style="font-size: 18px; color: #666; margin-top: 16px;">
+                        该线路可能在{{ day_type|replace('weekday', '工作日')|replace('saturday', '周六')|replace('sunday', '周日') }}不运营，或服务已暂停。
+                    </p>
+                {% endif %}
+            </section>
+
+            <section class="timetable-section">
+                <h2>下一班车</h2>
+                <p style="font-size: 18px; color: #666; margin-bottom: 16px;">
+                    查看从今天当前时间起的下一班公交车。
+                </p>
+                <a href="/next_bus?route_id={{ route.route_id }}" class="search-button" style="display: inline-block; text-decoration: none;">
+                    🕐 查看下一班车
+                </a>
+            </section>
+        </main>
+
+        <footer>
+            <p>数据由 TransLink 昆士兰东南部提供</p>
+        </footer>
+    </div>
+</body>
+</html>

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>错误 - 布里斯班公交车时刻表</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <a href="/" class="back-link">← 返回首页</a>
+        </header>
+
+        <main>
+            <section class="timetable-section" style="text-align: center;">
+                <h2 style="color: #DC3545; font-size: 48px; margin-bottom: 16px;">⚠️</h2>
+                <h2>出错了</h2>
+                <p class="no-results" style="font-size: 22px; margin: 24px 0;">
+                    {{ message }}
+                </p>
+                <a href="/" class="search-button" style="display: inline-block; text-decoration: none; margin-top: 24px;">
+                    返回首页
+                </a>
+            </section>
+        </main>
+
+        <footer>
+            <p>数据由 TransLink 昆士兰东南部提供</p>
+        </footer>
+    </div>
+</body>
+</html>
