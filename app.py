@@ -198,7 +198,7 @@ def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> 
     result = []
     seen: set = set()
     for r in rows:
-        key = f"{r['stop_id']}_{r['departure_time']}"
+        key = f"{r['stop_id']}_{r['dep_secs']}"
         if key in seen:
             continue
         seen.add(key)
