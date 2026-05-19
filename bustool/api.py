@@ -95,28 +95,23 @@ class GTFSData:
 
         conn.executescript("""
             CREATE TABLE stops (
-                stop_id   TEXT PRIMARY KEY,
+                stop_id   TEXT,
                 stop_code TEXT,
                 stop_name TEXT,
                 stop_lat  REAL,
                 stop_lon  REAL
             );
-            CREATE INDEX idx_stops_code ON stops(stop_code);
-
             CREATE TABLE routes (
-                route_id         TEXT PRIMARY KEY,
+                route_id         TEXT,
                 route_short_name TEXT,
                 route_long_name  TEXT
             );
-
             CREATE TABLE trips (
-                trip_id       TEXT PRIMARY KEY,
+                trip_id       TEXT,
                 route_id      TEXT,
                 service_id    TEXT,
                 trip_headsign TEXT
             );
-            CREATE INDEX idx_trips_route ON trips(route_id);
-
             CREATE TABLE stop_times (
                 trip_id        TEXT,
                 stop_id        TEXT,
@@ -125,23 +120,18 @@ class GTFSData:
                 dep_secs       INTEGER,
                 stop_sequence  INTEGER
             );
-            CREATE INDEX idx_st_stop ON stop_times(stop_id, dep_secs);
-            CREATE INDEX idx_st_trip ON stop_times(trip_id, stop_sequence);
-
             CREATE TABLE calendar (
-                service_id TEXT PRIMARY KEY,
+                service_id TEXT,
                 monday     INTEGER, tuesday  INTEGER, wednesday INTEGER,
                 thursday   INTEGER, friday   INTEGER, saturday  INTEGER,
                 sunday     INTEGER,
                 start_date TEXT,    end_date  TEXT
             );
-
             CREATE TABLE calendar_dates (
                 service_id     TEXT,
                 date           TEXT,
                 exception_type INTEGER
             );
-            CREATE INDEX idx_cd ON calendar_dates(service_id, date);
         """)
 
         with zipfile.ZipFile(_ZIP_PATH) as z:
@@ -210,6 +200,14 @@ class GTFSData:
                 for r in rows
             ])
 
+        print("  Building indexes…", flush=True)
+        conn.executescript("""
+            CREATE INDEX idx_stops_code ON stops(stop_code);
+            CREATE INDEX idx_trips_route ON trips(route_id);
+            CREATE INDEX idx_st_stop ON stop_times(stop_id, dep_secs);
+            CREATE INDEX idx_st_trip ON stop_times(trip_id, stop_sequence);
+            CREATE INDEX idx_cd ON calendar_dates(service_id, date);
+        """)
         conn.commit()
         conn.close()
 
