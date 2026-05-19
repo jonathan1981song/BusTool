@@ -113,12 +113,10 @@ class GTFSData:
                 trip_headsign TEXT
             );
             CREATE TABLE stop_times (
-                trip_id        TEXT,
-                stop_id        TEXT,
-                arrival_time   TEXT,
-                departure_time TEXT,
-                dep_secs       INTEGER,
-                stop_sequence  INTEGER
+                trip_id       TEXT,
+                stop_id       TEXT,
+                dep_secs      INTEGER,
+                stop_sequence INTEGER
             );
             CREATE TABLE calendar (
                 service_id TEXT,
@@ -171,15 +169,14 @@ class GTFSData:
                         secs = 0
                     batch.append((
                         row["trip_id"], row["stop_id"],
-                        row.get("arrival_time", ""), dep, secs,
-                        int(row["stop_sequence"]),
+                        secs, int(row["stop_sequence"]),
                     ))
                     if len(batch) >= 100_000:
-                        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
+                        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
                         count += len(batch)
                         batch.clear()
                 if batch:
-                    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
+                    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
                     count += len(batch)
             print(f"  stop_times: {count}", flush=True)
 
@@ -343,7 +340,7 @@ class GTFSData:
         c = self._conn()
         if direction:
             rows = c.execute(
-                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"SELECT DISTINCT st.dep_secs, t.trip_headsign, "
                 f"       st.stop_id, s.stop_name, s.stop_code "
                 f"FROM trips t "
                 f"JOIN stop_times st ON t.trip_id=st.trip_id "
@@ -355,7 +352,7 @@ class GTFSData:
             ).fetchall()
         else:
             rows = c.execute(
-                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"SELECT DISTINCT st.dep_secs, t.trip_headsign, "
                 f"       st.stop_id, s.stop_name, s.stop_code "
                 f"FROM trips t "
                 f"JOIN stop_times st ON t.trip_id=st.trip_id "
@@ -414,15 +411,16 @@ class GTFSData:
         from collections import defaultdict
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT t.trip_headsign, st.departure_time "
+            f"SELECT t.trip_headsign, st.dep_secs "
             f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
             f"WHERE t.route_id=? AND st.stop_id=? AND t.service_id IN ({ph}) "
-            f"ORDER BY st.departure_time",
+            f"ORDER BY st.dep_secs",
             (route_id, stop_id, *service_ids)
         ).fetchall()
         d: dict = defaultdict(list)
         for r in rows:
-            d[r[0]].append(r[1])
+            s = r[1]
+            d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
         return [{"headsign": h, "times": times} for h, times in d.items()]
 
     def get_timetable_origin(
@@ -433,7 +431,7 @@ class GTFSData:
         from collections import defaultdict
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT t.trip_headsign, st.stop_id, s.stop_name, st.departure_time "
+            f"SELECT t.trip_headsign, st.stop_id, s.stop_name, st.dep_secs "
             f"FROM trips t "
             f"JOIN stop_times st ON t.trip_id=st.trip_id "
             f"JOIN stops s ON st.stop_id=s.stop_id "
@@ -441,13 +439,14 @@ class GTFSData:
             f"  AND st.stop_sequence=("
             f"    SELECT MIN(s2.stop_sequence) FROM stop_times s2 WHERE s2.trip_id=t.trip_id"
             f"  ) "
-            f"ORDER BY st.departure_time",
+            f"ORDER BY st.dep_secs",
             (route_id, *service_ids)
         ).fetchall()
         data: dict = defaultdict(lambda: defaultdict(list))
         stop_names: dict = {}
         for r in rows:
-            data[r["trip_headsign"]][r["stop_id"]].append(r["departure_time"])
+            s = r["dep_secs"]
+            data[r["trip_headsign"]][r["stop_id"]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
             stop_names[r["stop_id"]] = r["stop_name"]
         result = []
         for headsign, stops in data.items():
@@ -523,7 +522,7 @@ class GTFSData:
             return []
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT st.departure_time, t.trip_headsign, r.route_short_name "
+            f"SELECT st.dep_secs, t.trip_headsign, r.route_short_name "
             f"FROM stop_times st "
             f"JOIN trips t ON st.trip_id=t.trip_id "
             f"JOIN routes r ON t.route_id=r.route_id "
@@ -534,6 +533,6 @@ class GTFSData:
         return [{
             "route":     r["route_short_name"],
             "headsign":  r["trip_headsign"],
-            "departure": r["departure_time"][:5],
+            "departure": f"{r['dep_secs']//3600:02d}:{(r['dep_secs']%3600)//60:02d}",
             "stop_code": stop_code,
         } for r in rows]
