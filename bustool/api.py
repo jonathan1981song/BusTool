@@ -1,317 +1,509 @@
 """
 bustool/api.py
 --------------
-Downloads and parses the official TransLink South-East Queensland GTFS
-static feed and provides three query functions:
+SQLite-backed GTFS data store for TransLink South-East Queensland.
 
-  • search_stops(query)          – find stops by name keyword
-  • search_routes(query)         – find routes by short or long name
-  • get_departures(stop_code)    – next scheduled departures from a stop
-
-GTFS feed URL (no API key required):
-  https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip
-
-The ZIP is cached on disk in a ``data/`` sub-folder next to this file.
-Call ``GTFSData.load(refresh=True)`` to force a fresh download.
-
-GTFS files used
----------------
-stops.txt       stop_id, stop_code, stop_name, stop_lat, stop_lon
-routes.txt      route_id, route_short_name, route_long_name
-trips.txt       route_id, service_id, trip_id, trip_headsign, direction_id
-stop_times.txt  trip_id, arrival_time, departure_time, stop_id, stop_sequence
-calendar.txt    service_id, monday…sunday, start_date, end_date
-calendar_dates.txt  service_id, date, exception_type
+On first run: downloads the GTFS zip (~38 MB) and builds a SQLite database.
+Subsequent runs reuse the database, keeping RAM well under 512 MB.
 """
 
 from __future__ import annotations
 
 import csv
 import io
-import os
+import math
+import sqlite3
+import threading
 import urllib.request
 import zipfile
-from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from pathlib import Path
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 GTFS_URL = "https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip"
 _DATA_DIR = Path(__file__).parent.parent / "data"
 _ZIP_PATH = _DATA_DIR / "SEQ_GTFS.zip"
-
-# How many hours before we consider the cached ZIP stale
+_DB_PATH  = _DATA_DIR / "gtfs.db"
 _CACHE_MAX_AGE_HOURS = 24
-
-# Days of the week as used in calendar.txt
 _DOW = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
 def _read_csv(z: zipfile.ZipFile, name: str) -> list[dict]:
-    """Read a CSV file from the ZIP and return a list of row dicts."""
     with z.open(name) as f:
-        reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
-        return list(reader)
+        return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")))
 
 
-def _parse_time(t: str) -> int:
-    """Convert a GTFS HH:MM:SS time string to total seconds.
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6_371_000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp, dl = math.radians(lat2 - lat1), math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    GTFS allows hours >= 24 for trips that run past midnight.
-    """
-    h, m, s = t.strip().split(":")
-    return int(h) * 3600 + int(m) * 60 + int(s)
-
-
-def _fmt_seconds(total: int) -> str:
-    """Format total seconds back to HH:MM (clamped to 23:59 for display)."""
-    h = (total // 3600) % 24
-    m = (total % 3600) // 60
-    return f"{h:02d}:{m:02d}"
-
-
-# ---------------------------------------------------------------------------
-# Main data class
-# ---------------------------------------------------------------------------
 
 class GTFSData:
-    """In-memory representation of the TransLink GTFS static feed."""
+    """SQLite-backed GTFS data. Thread-safe via thread-local connections."""
 
     def __init__(self) -> None:
-        # stop_code -> {stop_id, stop_code, stop_name, stop_lat, stop_lon}
-        self.stops_by_code: dict[str, dict] = {}
-        # stop_id -> same dict
-        self.stops_by_id: dict[str, dict] = {}
+        self._local = threading.local()
 
-        # route_id -> {route_id, route_short_name, route_long_name}
-        self.routes: dict[str, dict] = {}
+    # ------------------------------------------------------------------ #
+    # Connection
+    # ------------------------------------------------------------------ #
 
-        # trip_id -> {route_id, service_id, trip_id, trip_headsign}
-        self.trips: dict[str, dict] = {}
-        # route_id -> list of trip dicts (same objects as self.trips values)
-        self.trips_by_route: dict[str, list[dict]] = defaultdict(list)
+    def _conn(self) -> sqlite3.Connection:
+        if not hasattr(self._local, "conn"):
+            conn = sqlite3.connect(str(_DB_PATH))
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA cache_size=-16000")
+            conn.execute("PRAGMA temp_store=MEMORY")
+            self._local.conn = conn
+        return self._local.conn
 
-        # stop_id -> list of {trip_id, arrival_time (str), departure_time (str), stop_sequence}
-        self.stop_times_by_stop: dict[str, list[dict]] = defaultdict(list)
-        # trip_id -> list of {stop_id, arrival_time (str), departure_time (str), stop_sequence}
-        self.stop_times_by_trip: dict[str, list[dict]] = defaultdict(list)
-
-        # stop_id -> set of route_ids that serve it (built after loading)
-        self.routes_by_stop: dict[str, set[str]] = defaultdict(set)
-
-        # service_id -> {monday…sunday, start_date, end_date}
-        self.calendar: dict[str, dict] = {}
-
-        # service_id -> set of date strings "YYYYMMDD" that are ADDED (exception_type=1)
-        self.calendar_added: dict[str, set[str]] = defaultdict(set)
-        # service_id -> set of date strings that are REMOVED (exception_type=2)
-        self.calendar_removed: dict[str, set[str]] = defaultdict(set)
-
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
     # Loading
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
     @classmethod
     def load(cls, refresh: bool = False) -> "GTFSData":
-        """Download (if needed) and parse the GTFS ZIP.
-
-        Parameters
-        ----------
-        refresh:
-            When True, always download a fresh copy even if a cached file
-            exists.  When False (default), the cached file is reused if it
-            is less than 24 hours old.
-
-        Returns
-        -------
-        GTFSData
-            Fully populated instance ready for querying.
-        """
         _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
         need_download = refresh or not _ZIP_PATH.exists()
         if not need_download:
-            age_hours = (
-                datetime.now().timestamp() - _ZIP_PATH.stat().st_mtime
-            ) / 3600
-            if age_hours > _CACHE_MAX_AGE_HOURS:
+            age = (datetime.now().timestamp() - _ZIP_PATH.stat().st_mtime) / 3600
+            if age > _CACHE_MAX_AGE_HOURS:
                 need_download = True
 
         if need_download:
-            print("Downloading TransLink GTFS data (≈38 MB) …", flush=True)
+            print("Downloading TransLink GTFS data (~38 MB)…", flush=True)
             urllib.request.urlretrieve(GTFS_URL, _ZIP_PATH)
             print("Download complete.", flush=True)
 
         obj = cls()
-        obj._parse(_ZIP_PATH)
+        if need_download or not _DB_PATH.exists():
+            print("Building SQLite database…", flush=True)
+            obj._build_db()
+            print("Database ready.", flush=True)
         return obj
 
-    def _parse(self, zip_path: Path) -> None:
-        """Parse all required GTFS files from the ZIP."""
-        with zipfile.ZipFile(zip_path) as z:
-            self._load_stops(z)
-            self._load_routes(z)
-            self._load_trips(z)
-            self._load_stop_times(z)
-            self._load_calendar(z)
-            self._load_calendar_dates(z)
-        self._build_routes_by_stop()
+    def _build_db(self) -> None:
+        if _DB_PATH.exists():
+            _DB_PATH.unlink()
 
-    def _build_routes_by_stop(self) -> None:
-        """Build stop_id -> set of route_ids index (run once after loading)."""
-        for trip_id, trip in self.trips.items():
-            route_id = trip["route_id"]
-            for st in self.stop_times_by_trip.get(trip_id, []):
-                self.routes_by_stop[st["stop_id"]].add(route_id)
+        conn = sqlite3.connect(str(_DB_PATH))
+        conn.execute("PRAGMA journal_mode=OFF")
+        conn.execute("PRAGMA synchronous=OFF")
 
-    def _load_stops(self, z: zipfile.ZipFile) -> None:
-        for row in _read_csv(z, "stops.txt"):
-            entry = {
-                "stop_id":   row["stop_id"],
-                "stop_code": row["stop_code"],
-                "stop_name": row["stop_name"],
-                "stop_lat":  row.get("stop_lat", "").strip(),
-                "stop_lon":  row.get("stop_lon", "").strip(),
-            }
-            self.stops_by_id[row["stop_id"]] = entry
-            self.stops_by_code[row["stop_code"]] = entry
+        conn.executescript("""
+            CREATE TABLE stops (
+                stop_id   TEXT PRIMARY KEY,
+                stop_code TEXT,
+                stop_name TEXT,
+                stop_lat  REAL,
+                stop_lon  REAL
+            );
+            CREATE INDEX idx_stops_code ON stops(stop_code);
 
-    def _load_routes(self, z: zipfile.ZipFile) -> None:
-        for row in _read_csv(z, "routes.txt"):
-            self.routes[row["route_id"]] = {
-                "route_id":         row["route_id"],
-                "route_short_name": row["route_short_name"],
-                "route_long_name":  row["route_long_name"],
-            }
+            CREATE TABLE routes (
+                route_id         TEXT PRIMARY KEY,
+                route_short_name TEXT,
+                route_long_name  TEXT
+            );
 
-    def _load_trips(self, z: zipfile.ZipFile) -> None:
-        for row in _read_csv(z, "trips.txt"):
-            entry = {
-                "trip_id":       row["trip_id"],
-                "route_id":      row["route_id"],
-                "service_id":    row["service_id"],
-                "trip_headsign": row.get("trip_headsign", ""),
-            }
-            self.trips[row["trip_id"]] = entry
-            self.trips_by_route[row["route_id"]].append(entry)
+            CREATE TABLE trips (
+                trip_id       TEXT PRIMARY KEY,
+                route_id      TEXT,
+                service_id    TEXT,
+                trip_headsign TEXT
+            );
+            CREATE INDEX idx_trips_route ON trips(route_id);
 
-    def _load_stop_times(self, z: zipfile.ZipFile) -> None:
-        with z.open("stop_times.txt") as f:
-            reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
-            for row in reader:
-                stop_id = row["stop_id"]
-                trip_id = row["trip_id"]
-                seq = int(row["stop_sequence"])
-                arr = row["arrival_time"]
-                dep = row["departure_time"]
-                self.stop_times_by_stop[stop_id].append({
-                    "trip_id":        trip_id,
-                    "arrival_time":   arr,
-                    "departure_time": dep,
-                    "stop_sequence":  seq,
-                })
-                self.stop_times_by_trip[trip_id].append({
-                    "stop_id":        stop_id,
-                    "arrival_time":   arr,
-                    "departure_time": dep,
-                    "stop_sequence":  seq,
-                })
+            CREATE TABLE stop_times (
+                trip_id        TEXT,
+                stop_id        TEXT,
+                arrival_time   TEXT,
+                departure_time TEXT,
+                dep_secs       INTEGER,
+                stop_sequence  INTEGER
+            );
+            CREATE INDEX idx_st_stop ON stop_times(stop_id, dep_secs);
+            CREATE INDEX idx_st_trip ON stop_times(trip_id, stop_sequence);
 
-    def _load_calendar(self, z: zipfile.ZipFile) -> None:
-        for row in _read_csv(z, "calendar.txt"):
-            self.calendar[row["service_id"]] = row
+            CREATE TABLE calendar (
+                service_id TEXT PRIMARY KEY,
+                monday     INTEGER, tuesday  INTEGER, wednesday INTEGER,
+                thursday   INTEGER, friday   INTEGER, saturday  INTEGER,
+                sunday     INTEGER,
+                start_date TEXT,    end_date  TEXT
+            );
 
-    def _load_calendar_dates(self, z: zipfile.ZipFile) -> None:
-        for row in _read_csv(z, "calendar_dates.txt"):
-            sid = row["service_id"]
-            d   = row["date"]
-            if row["exception_type"] == "1":
-                self.calendar_added[sid].add(d)
-            else:
-                self.calendar_removed[sid].add(d)
+            CREATE TABLE calendar_dates (
+                service_id     TEXT,
+                date           TEXT,
+                exception_type INTEGER
+            );
+            CREATE INDEX idx_cd ON calendar_dates(service_id, date);
+        """)
 
-    # ------------------------------------------------------------------
+        with zipfile.ZipFile(_ZIP_PATH) as z:
+            rows = _read_csv(z, "stops.txt")
+            conn.executemany("INSERT INTO stops VALUES (?,?,?,?,?)", [
+                (r["stop_id"], r.get("stop_code", ""), r["stop_name"],
+                 float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0))
+                for r in rows
+            ])
+            print(f"  stops: {len(rows)}", flush=True)
+
+            rows = _read_csv(z, "routes.txt")
+            conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
+                (r["route_id"], r["route_short_name"], r["route_long_name"])
+                for r in rows
+            ])
+            print(f"  routes: {len(rows)}", flush=True)
+
+            rows = _read_csv(z, "trips.txt")
+            conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", [
+                (r["trip_id"], r["route_id"], r["service_id"],
+                 r.get("trip_headsign", ""))
+                for r in rows
+            ])
+            print(f"  trips: {len(rows)}", flush=True)
+
+            count = 0
+            with z.open("stop_times.txt") as f:
+                reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+                batch: list = []
+                for row in reader:
+                    dep = row["departure_time"]
+                    try:
+                        h, m, s = dep.split(":")
+                        secs = int(h) * 3600 + int(m) * 60 + int(s)
+                    except Exception:
+                        secs = 0
+                    batch.append((
+                        row["trip_id"], row["stop_id"],
+                        row.get("arrival_time", ""), dep, secs,
+                        int(row["stop_sequence"]),
+                    ))
+                    if len(batch) >= 100_000:
+                        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
+                        count += len(batch)
+                        batch.clear()
+                if batch:
+                    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
+                    count += len(batch)
+            print(f"  stop_times: {count}", flush=True)
+
+            rows = _read_csv(z, "calendar.txt")
+            conn.executemany("INSERT INTO calendar VALUES (?,?,?,?,?,?,?,?,?,?)", [
+                (r["service_id"],
+                 int(r.get("monday", 0)), int(r.get("tuesday", 0)),
+                 int(r.get("wednesday", 0)), int(r.get("thursday", 0)),
+                 int(r.get("friday", 0)), int(r.get("saturday", 0)),
+                 int(r.get("sunday", 0)),
+                 r["start_date"], r["end_date"])
+                for r in rows
+            ])
+
+            rows = _read_csv(z, "calendar_dates.txt")
+            conn.executemany("INSERT INTO calendar_dates VALUES (?,?,?)", [
+                (r["service_id"], r["date"], int(r["exception_type"]))
+                for r in rows
+            ])
+
+        conn.commit()
+        conn.close()
+
+    # ------------------------------------------------------------------ #
     # Service-day helpers
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
 
-    def _is_service_running(self, service_id: str, on_date: date) -> bool:
-        """Return True if *service_id* operates on *on_date*."""
+    def get_active_service_ids(self, on_date: date) -> set[str]:
         date_str = on_date.strftime("%Y%m%d")
+        dow = _DOW[on_date.weekday()]
+        c = self._conn()
+        rows = c.execute(
+            f"SELECT service_id FROM calendar "
+            f"WHERE {dow}=1 AND start_date<=? AND end_date>=?",
+            (date_str, date_str)
+        ).fetchall()
+        active = {r[0] for r in rows}
+        for sid, exc in c.execute(
+            "SELECT service_id, exception_type FROM calendar_dates WHERE date=?",
+            (date_str,)
+        ).fetchall():
+            if exc == 1:
+                active.add(sid)
+            else:
+                active.discard(sid)
+        return active
 
-        # calendar_dates overrides take priority
-        if date_str in self.calendar_added.get(service_id, set()):
-            return True
-        if date_str in self.calendar_removed.get(service_id, set()):
-            return False
+    def get_service_ids_for_day_type(self, day_type: str) -> set[str]:
+        if day_type == "weekday":
+            col = "monday=1 OR tuesday=1 OR wednesday=1 OR thursday=1 OR friday=1"
+        elif day_type == "saturday":
+            col = "saturday=1"
+        elif day_type == "sunday":
+            col = "sunday=1"
+        else:
+            return set()
+        rows = self._conn().execute(
+            f"SELECT service_id FROM calendar WHERE {col}"
+        ).fetchall()
+        return {r[0] for r in rows}
 
-        cal = self.calendar.get(service_id)
-        if cal is None:
-            return False
+    # ------------------------------------------------------------------ #
+    # Single-object lookups
+    # ------------------------------------------------------------------ #
 
-        # Check date range
-        if not (cal["start_date"] <= date_str <= cal["end_date"]):
-            return False
+    def get_route(self, route_id: str) -> dict | None:
+        r = self._conn().execute(
+            "SELECT * FROM routes WHERE route_id=?", (route_id,)
+        ).fetchone()
+        return dict(r) if r else None
 
-        # Check day-of-week flag
-        dow_name = _DOW[on_date.weekday()]
-        return cal.get(dow_name, "0") == "1"
+    def get_stop_by_id(self, stop_id: str) -> dict | None:
+        r = self._conn().execute(
+            "SELECT * FROM stops WHERE stop_id=?", (stop_id,)
+        ).fetchone()
+        return dict(r) if r else None
 
-    # ------------------------------------------------------------------
-    # Public query methods
-    # ------------------------------------------------------------------
+    def get_stop_by_code(self, stop_code: str) -> dict | None:
+        r = self._conn().execute(
+            "SELECT * FROM stops WHERE stop_code=?", (stop_code,)
+        ).fetchone()
+        return dict(r) if r else None
+
+    # ------------------------------------------------------------------ #
+    # Route / stop lists
+    # ------------------------------------------------------------------ #
+
+    def get_direction_stops(self, route_id: str, direction: str) -> list[dict]:
+        """Unique stops for a route+direction in stop_sequence order."""
+        c = self._conn()
+        if direction:
+            rows = c.execute(
+                "SELECT st.stop_id, s.stop_name, MIN(st.stop_sequence) as seq "
+                "FROM trips t "
+                "JOIN stop_times st ON t.trip_id=st.trip_id "
+                "JOIN stops s ON st.stop_id=s.stop_id "
+                "WHERE t.route_id=? AND LOWER(t.trip_headsign) LIKE ? "
+                "GROUP BY st.stop_id ORDER BY MIN(st.stop_sequence)",
+                (route_id, f"%{direction.lower()}%")
+            ).fetchall()
+        else:
+            rows = c.execute(
+                "SELECT st.stop_id, s.stop_name, MIN(st.stop_sequence) as seq "
+                "FROM trips t "
+                "JOIN stop_times st ON t.trip_id=st.trip_id "
+                "JOIN stops s ON st.stop_id=s.stop_id "
+                "WHERE t.route_id=? "
+                "GROUP BY st.stop_id ORDER BY MIN(st.stop_sequence)",
+                (route_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_route_all_stops(self, route_id: str) -> list[dict]:
+        rows = self._conn().execute(
+            "SELECT st.stop_id, s.stop_code, s.stop_name, s.stop_lat, s.stop_lon, "
+            "       MIN(st.stop_sequence) as seq "
+            "FROM trips t "
+            "JOIN stop_times st ON t.trip_id=st.trip_id "
+            "JOIN stops s ON st.stop_id=s.stop_id "
+            "WHERE t.route_id=? "
+            "GROUP BY st.stop_id ORDER BY MIN(st.stop_sequence)",
+            (route_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_route_stops_with_headsign(self, route_id: str) -> list[dict]:
+        rows = self._conn().execute(
+            "SELECT st.stop_id, s.stop_name, s.stop_lat, s.stop_lon, t.trip_headsign "
+            "FROM trips t "
+            "JOIN stop_times st ON t.trip_id=st.trip_id "
+            "JOIN stops s ON st.stop_id=s.stop_id "
+            "WHERE t.route_id=? "
+            "GROUP BY st.stop_id",
+            (route_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Departure queries
+    # ------------------------------------------------------------------ #
+
+    def get_next_departures(
+        self,
+        route_id: str,
+        service_ids: set[str],
+        after_secs: int,
+        direction: str = "",
+        limit: int = 30,
+    ) -> list[dict]:
+        if not service_ids:
+            return []
+        ph = ",".join("?" * len(service_ids))
+        c = self._conn()
+        if direction:
+            rows = c.execute(
+                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"       st.stop_id, s.stop_name, s.stop_code "
+                f"FROM trips t "
+                f"JOIN stop_times st ON t.trip_id=st.trip_id "
+                f"JOIN stops s ON st.stop_id=s.stop_id "
+                f"WHERE t.route_id=? AND t.service_id IN ({ph}) AND st.dep_secs>? "
+                f"  AND LOWER(t.trip_headsign) LIKE ? "
+                f"ORDER BY st.dep_secs LIMIT ?",
+                (route_id, *service_ids, after_secs, f"%{direction.lower()}%", limit)
+            ).fetchall()
+        else:
+            rows = c.execute(
+                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"       st.stop_id, s.stop_name, s.stop_code "
+                f"FROM trips t "
+                f"JOIN stop_times st ON t.trip_id=st.trip_id "
+                f"JOIN stops s ON st.stop_id=s.stop_id "
+                f"WHERE t.route_id=? AND t.service_id IN ({ph}) AND st.dep_secs>? "
+                f"ORDER BY st.dep_secs LIMIT ?",
+                (route_id, *service_ids, after_secs, limit)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_departures_for_stops(
+        self,
+        stop_ids: list[str],
+        service_ids: set[str],
+        after_secs: int,
+    ) -> list[dict]:
+        if not stop_ids or not service_ids:
+            return []
+        ph_s = ",".join("?" * len(stop_ids))
+        ph_v = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT st.stop_id, st.dep_secs, t.route_id, t.trip_headsign, "
+            f"       r.route_short_name, r.route_long_name "
+            f"FROM stop_times st "
+            f"JOIN trips t ON st.trip_id=t.trip_id "
+            f"JOIN routes r ON t.route_id=r.route_id "
+            f"WHERE st.stop_id IN ({ph_s}) AND st.dep_secs>? AND t.service_id IN ({ph_v}) "
+            f"ORDER BY st.dep_secs",
+            (*stop_ids, after_secs, *service_ids)
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_all_routes_at_stops(self, stop_ids: list[str]) -> list[dict]:
+        if not stop_ids:
+            return []
+        ph = ",".join("?" * len(stop_ids))
+        rows = self._conn().execute(
+            f"SELECT DISTINCT t.route_id, r.route_short_name, r.route_long_name, st.stop_id "
+            f"FROM stop_times st "
+            f"JOIN trips t ON st.trip_id=t.trip_id "
+            f"JOIN routes r ON t.route_id=r.route_id "
+            f"WHERE st.stop_id IN ({ph})",
+            stop_ids
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------ #
+    # Timetable queries
+    # ------------------------------------------------------------------ #
+
+    def get_timetable_at_stop(
+        self, route_id: str, stop_id: str, service_ids: set[str]
+    ) -> list[dict]:
+        if not service_ids:
+            return []
+        from collections import defaultdict
+        ph = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.departure_time "
+            f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"WHERE t.route_id=? AND st.stop_id=? AND t.service_id IN ({ph}) "
+            f"ORDER BY st.departure_time",
+            (route_id, stop_id, *service_ids)
+        ).fetchall()
+        d: dict = defaultdict(list)
+        for r in rows:
+            d[r[0]].append(r[1])
+        return [{"headsign": h, "times": times} for h, times in d.items()]
+
+    def get_timetable_origin(
+        self, route_id: str, service_ids: set[str]
+    ) -> list[dict]:
+        if not service_ids:
+            return []
+        from collections import defaultdict
+        ph = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.stop_id, s.stop_name, st.departure_time "
+            f"FROM trips t "
+            f"JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"JOIN stops s ON st.stop_id=s.stop_id "
+            f"WHERE t.route_id=? AND t.service_id IN ({ph}) "
+            f"  AND st.stop_sequence=("
+            f"    SELECT MIN(s2.stop_sequence) FROM stop_times s2 WHERE s2.trip_id=t.trip_id"
+            f"  ) "
+            f"ORDER BY st.departure_time",
+            (route_id, *service_ids)
+        ).fetchall()
+        data: dict = defaultdict(lambda: defaultdict(list))
+        stop_names: dict = {}
+        for r in rows:
+            data[r["trip_headsign"]][r["stop_id"]].append(r["departure_time"])
+            stop_names[r["stop_id"]] = r["stop_name"]
+        result = []
+        for headsign, stops in data.items():
+            for sid, times in stops.items():
+                result.append({
+                    "headsign": headsign,
+                    "stop_name": stop_names[sid],
+                    "times": times,
+                })
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Nearby stops
+    # ------------------------------------------------------------------ #
+
+    def get_stops_near(
+        self, lat: float, lon: float, radius_m: float
+    ) -> list[tuple[str, float]]:
+        lat_d = radius_m / 111_000
+        lon_d = radius_m / (111_000 * math.cos(math.radians(lat)))
+        rows = self._conn().execute(
+            "SELECT stop_id, stop_lat, stop_lon FROM stops "
+            "WHERE stop_lat BETWEEN ? AND ? AND stop_lon BETWEEN ? AND ?",
+            (lat - lat_d, lat + lat_d, lon - lon_d, lon + lon_d)
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = _haversine_m(lat, lon, r["stop_lat"], r["stop_lon"])
+            if d <= radius_m:
+                result.append((r["stop_id"], d))
+        result.sort(key=lambda x: x[1])
+        return result
+
+    # ------------------------------------------------------------------ #
+    # Search
+    # ------------------------------------------------------------------ #
 
     def search_stops(self, query: str, limit: int = 10) -> list[dict]:
-        """Return stops whose name contains *query* (case-insensitive).
-
-        Parameters
-        ----------
-        query:
-            Partial stop name or suburb, e.g. ``"Roma Street"`` or ``"Indooroopilly"``.
-        limit:
-            Maximum number of results to return (default 10).
-
-        Returns
-        -------
-        list[dict]
-            Each dict has keys: ``stop_code``, ``stop_name``, ``stop_lat``, ``stop_lon``.
-        """
-        q = query.lower()
-        results = [
-            s for s in self.stops_by_id.values()
-            if q in s["stop_name"].lower()
-        ]
-        results.sort(key=lambda s: s["stop_name"])
-        return results[:limit]
+        rows = self._conn().execute(
+            "SELECT stop_code, stop_name, stop_lat, stop_lon FROM stops "
+            "WHERE LOWER(stop_name) LIKE ? ORDER BY stop_name LIMIT ?",
+            (f"%{query.lower()}%", limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def search_routes(self, query: str, limit: int = 10) -> list[dict]:
-        """Return routes whose short or long name contains *query*.
-
-        Parameters
-        ----------
-        query:
-            Route number or partial name, e.g. ``"333"`` or ``"Eight Mile Plains"``.
-        limit:
-            Maximum number of results to return (default 10).
-
-        Returns
-        -------
-        list[dict]
-            Each dict has keys: ``route_id``, ``route_short_name``, ``route_long_name``.
-        """
-        q = query.lower()
-        results = [
-            r for r in self.routes.values()
-            if q in r["route_short_name"].lower() or q in r["route_long_name"].lower()
-        ]
-        results.sort(key=lambda r: r["route_short_name"])
-        return results[:limit]
+        q = f"%{query.lower()}%"
+        rows = self._conn().execute(
+            "SELECT route_id, route_short_name, route_long_name FROM routes "
+            "WHERE LOWER(route_short_name) LIKE ? OR LOWER(route_long_name) LIKE ? "
+            "ORDER BY route_short_name LIMIT ?",
+            (q, q, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
 
     def get_departures(
         self,
@@ -320,82 +512,30 @@ class GTFSData:
         on_date: date | None = None,
         after_time: int | None = None,
     ) -> list[dict]:
-        """Return the next scheduled departures from a stop.
-
-        Parameters
-        ----------
-        stop_code:
-            The 6-digit TransLink stop code printed on the bus stop sign
-            (e.g. ``"000007"``).
-        count:
-            Maximum number of upcoming departures to return (default 10).
-        on_date:
-            The date to query.  Defaults to today (Brisbane local time).
-        after_time:
-            Seconds-since-midnight lower bound.  Defaults to now.
-
-        Returns
-        -------
-        list[dict]
-            Sorted by departure time.  Each dict has:
-            ``route``, ``headsign``, ``departure``, ``stop_code``.
-
-        Raises
-        ------
-        ValueError
-            If *stop_code* is not found in the GTFS data.
-        """
-        stop = self.stops_by_code.get(stop_code)
+        stop = self.get_stop_by_code(stop_code)
         if stop is None:
-            raise ValueError(f"Stop code '{stop_code}' not found in GTFS data.")
-
-        stop_id = stop["stop_id"]
-
+            raise ValueError(f"Stop code '{stop_code}' not found.")
         if on_date is None:
             on_date = date.today()
         if after_time is None:
             now = datetime.now()
             after_time = now.hour * 3600 + now.minute * 60 + now.second
-
-        # Also look at tomorrow for services that run past midnight
-        dates_to_check = [on_date, on_date + timedelta(days=1)]
-
-        departures: list[dict] = []
-
-        for st in self.stop_times_by_stop.get(stop_id, []):
-            dep_secs = _parse_time(st["departure_time"])
-
-            for check_date in dates_to_check:
-                # For tomorrow, only include services whose GTFS time >= 24h
-                # (i.e. they are a continuation of a service that started yesterday)
-                if check_date == on_date + timedelta(days=1) and dep_secs < 86400:
-                    continue
-
-                trip = self.trips.get(st["trip_id"])
-                if trip is None:
-                    continue
-
-                if not self._is_service_running(trip["service_id"], check_date):
-                    continue
-
-                # Normalise time for comparison: subtract 24h for next-day trips
-                effective_secs = dep_secs if check_date == on_date else dep_secs - 86400
-
-                if effective_secs < after_time:
-                    continue
-
-                route = self.routes.get(trip["route_id"], {})
-                departures.append({
-                    "route":      route.get("route_short_name", "?"),
-                    "headsign":   trip["trip_headsign"],
-                    "departure":  _fmt_seconds(dep_secs),
-                    "stop_code":  stop_code,
-                    "_sort_key":  effective_secs,
-                })
-
-        departures.sort(key=lambda d: d["_sort_key"])
-        # Remove internal sort key before returning
-        for d in departures:
-            del d["_sort_key"]
-
-        return departures[:count]
+        service_ids = self.get_active_service_ids(on_date)
+        if not service_ids:
+            return []
+        ph = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT st.departure_time, t.trip_headsign, r.route_short_name "
+            f"FROM stop_times st "
+            f"JOIN trips t ON st.trip_id=t.trip_id "
+            f"JOIN routes r ON t.route_id=r.route_id "
+            f"WHERE st.stop_id=? AND st.dep_secs>? AND t.service_id IN ({ph}) "
+            f"ORDER BY st.dep_secs LIMIT ?",
+            (stop["stop_id"], after_time, *service_ids, count)
+        ).fetchall()
+        return [{
+            "route":     r["route_short_name"],
+            "headsign":  r["trip_headsign"],
+            "departure": r["departure_time"][:5],
+            "stop_code": stop_code,
+        } for r in rows]
