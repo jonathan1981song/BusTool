@@ -26,6 +26,12 @@ _DB_PATH  = _DATA_DIR / "gtfs.db"
 _CACHE_MAX_AGE_HOURS = 24
 _DOW = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
+# Only load routes that serve these suburbs — keeps the DB small enough for free hosting.
+SUBURB_FILTER = [
+    "indooroopilly", "taringa", "st lucia", "toowong",
+    "auchenflower", "chelmer", "graceville", "sherwood",
+]
+
 
 def _read_csv(z: zipfile.ZipFile, name: str) -> list[dict]:
     with z.open(name) as f:
@@ -92,6 +98,8 @@ class GTFSData:
         conn = sqlite3.connect(str(_DB_PATH))
         conn.execute("PRAGMA journal_mode=OFF")
         conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-4000")
 
         conn.executescript("""
             CREATE TABLE stops (
@@ -133,34 +141,59 @@ class GTFSData:
         """)
 
         with zipfile.ZipFile(_ZIP_PATH) as z:
-            rows = _read_csv(z, "stops.txt")
+            # Step 1: load all stops; find which stop_ids are in target suburbs
+            all_stops = _read_csv(z, "stops.txt")
+            target_stop_ids = {
+                r["stop_id"] for r in all_stops
+                if any(kw in r["stop_name"].lower() for kw in SUBURB_FILTER)
+            }
+            print(f"  target suburb stops: {len(target_stop_ids)}", flush=True)
+
+            # Step 2: first pass over stop_times — find trip_ids that serve target suburbs
+            relevant_trip_ids: set[str] = set()
+            with z.open("stop_times.txt") as f:
+                for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                    if row["stop_id"] in target_stop_ids:
+                        relevant_trip_ids.add(row["trip_id"])
+            print(f"  relevant trips: {len(relevant_trip_ids)}", flush=True)
+
+            # Step 3: filter trips and collect route_ids
+            all_trips = _read_csv(z, "trips.txt")
+            filtered_trips = [r for r in all_trips if r["trip_id"] in relevant_trip_ids]
+            relevant_route_ids = {r["route_id"] for r in filtered_trips}
+
+            # Step 4: insert stops (all of them — small file, needed for full route display)
             conn.executemany("INSERT INTO stops VALUES (?,?,?,?,?)", [
                 (r["stop_id"], r.get("stop_code", ""), r["stop_name"],
                  float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0))
-                for r in rows
+                for r in all_stops
             ])
-            print(f"  stops: {len(rows)}", flush=True)
+            print(f"  stops: {len(all_stops)}", flush=True)
 
-            rows = _read_csv(z, "routes.txt")
+            # Step 5: insert filtered routes
+            all_routes = _read_csv(z, "routes.txt")
+            filtered_routes = [r for r in all_routes if r["route_id"] in relevant_route_ids]
             conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
                 (r["route_id"], r["route_short_name"], r["route_long_name"])
-                for r in rows
+                for r in filtered_routes
             ])
-            print(f"  routes: {len(rows)}", flush=True)
+            print(f"  routes: {len(filtered_routes)} (of {len(all_routes)})", flush=True)
 
-            rows = _read_csv(z, "trips.txt")
+            # Step 6: insert filtered trips
             conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", [
-                (r["trip_id"], r["route_id"], r["service_id"],
-                 r.get("trip_headsign", ""))
-                for r in rows
+                (r["trip_id"], r["route_id"], r["service_id"], r.get("trip_headsign", ""))
+                for r in filtered_trips
             ])
-            print(f"  trips: {len(rows)}", flush=True)
+            print(f"  trips: {len(filtered_trips)} (of {len(all_trips)})", flush=True)
 
+            # Step 7: second pass over stop_times — insert only relevant trips
             count = 0
             with z.open("stop_times.txt") as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
                 batch: list = []
                 for row in reader:
+                    if row["trip_id"] not in relevant_trip_ids:
+                        continue
                     dep = row["departure_time"]
                     try:
                         h, m, s = dep.split(":")
@@ -171,15 +204,16 @@ class GTFSData:
                         row["trip_id"], row["stop_id"],
                         secs, int(row["stop_sequence"]),
                     ))
-                    if len(batch) >= 100_000:
+                    if len(batch) >= 50_000:
                         conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
                         count += len(batch)
                         batch.clear()
                 if batch:
                     conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
                     count += len(batch)
-            print(f"  stop_times: {count}", flush=True)
+            print(f"  stop_times: {count} (filtered)", flush=True)
 
+            # Calendar stays unfiltered (small files)
             rows = _read_csv(z, "calendar.txt")
             conn.executemany("INSERT INTO calendar VALUES (?,?,?,?,?,?,?,?,?,?)", [
                 (r["service_id"],
