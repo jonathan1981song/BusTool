@@ -6,7 +6,7 @@
     <meta name="theme-color" content="#0055A4">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <link rel="manifest" href="/static/manifest.json">
-    <title>{{ route.route_short_name }}路 → {{ direction }} - 布里斯班公交车查询</title>
+    <title>{{ route.route_short_name }}路 - 布里斯班公交车查询</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
@@ -21,62 +21,91 @@
                     <div class="route-number">{{ route.route_short_name }}</div>
                     <div class="route-header-info">
                         <h2>{{ route.route_long_name }}</h2>
-                        <p class="direction-name">→ {{ direction }}</p>
+                        {% if stop_name %}
+                        <p style="font-size:17px;color:#555;margin-top:6px;">📍 {{ stop_name }}</p>
+                        {% endif %}
                     </div>
                 </div>
             </section>
 
-            <section class="timetable-section">
-                <h2>即将发车</h2>
-                {% if departures %}
-                    <div class="next-bus-list">
-                        {% for dep in departures[:10] %}
-                        <div class="next-bus-item">
-                            <div class="next-bus-time">{{ dep.departure }}</div>
-                            <div class="next-bus-info">
-                                <div class="next-bus-stop">{{ dep.stop_name }}</div>
+            {% if directions is defined %}
+                <!-- Per-stop, per-direction view -->
+                {% if directions %}
+                    {% for d in directions %}
+                    <section class="timetable-section" style="margin-bottom:16px;">
+                        <h2 style="font-size:20px;color:#F37021;margin-bottom:12px;">→ {{ d.headsign }}</h2>
+                        <div class="next-bus-list">
+                            {% for t in d.times %}
+                            <div class="next-bus-item">
+                                <div class="next-bus-time">{{ t }}</div>
                             </div>
+                            {% endfor %}
                         </div>
-                        {% endfor %}
-                    </div>
+                    </section>
+                    {% endfor %}
                 {% else %}
-                    <p class="no-results">今天当前时间后暂无发车。</p>
+                    <section class="timetable-section">
+                        <p class="no-results">今天当前时间后暂无发车。</p>
+                    </section>
                 {% endif %}
-            </section>
 
-            <section class="timetable-section">
-                <h2>所有站点</h2>
-                {% if stops %}
-                    <ul class="stop-list">
-                        {% for stop in stops %}
-                        <li class="stop-item {% if stop.stop_id == stop_id %}current-stop{% endif %}">
-                            <div class="stop-dot"></div>
-                            {% if stop.stop_id == stop_id %}
-                                <div class="stop-name current-stop-name">📍 {{ stop.stop_name }}</div>
-                            {% else %}
-                                <div class="stop-name">{{ stop.stop_name }}</div>
-                            {% endif %}
-                        </li>
-                        {% endfor %}
-                    </ul>
-                {% else %}
-                    <p class="no-results">该方向暂无站点信息。</p>
-                {% endif %}
-            </section>
+            {% else %}
+                <!-- Full route view (no stop selected) -->
+                <section class="timetable-section">
+                    <h2>即将发车</h2>
+                    {% if departures %}
+                        <div class="next-bus-list">
+                            {% for dep in departures[:10] %}
+                            <div class="next-bus-item">
+                                <div class="next-bus-time">{{ dep.departure }}</div>
+                                <div class="next-bus-info">
+                                    <div class="next-bus-stop">{{ dep.stop_name }}</div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                    {% else %}
+                        <p class="no-results">今天当前时间后暂无发车。</p>
+                    {% endif %}
+                </section>
+
+                <section class="timetable-section">
+                    <h2>所有站点</h2>
+                    {% if stops %}
+                        <ul class="stop-list">
+                            {% for stop in stops %}
+                            <li class="stop-item {% if stop.stop_id == stop_id %}current-stop{% endif %}">
+                                <div class="stop-dot"></div>
+                                {% if stop.stop_id == stop_id %}
+                                    <div class="stop-name current-stop-name">📍 {{ stop.stop_name }}</div>
+                                {% else %}
+                                    <div class="stop-name">{{ stop.stop_name }}</div>
+                                {% endif %}
+                            </li>
+                            {% endfor %}
+                        </ul>
+                    {% else %}
+                        <p class="no-results">该方向暂无站点信息。</p>
+                    {% endif %}
+                </section>
+            {% endif %}
 
             <section class="timetable-section">
                 <h2>完整时刻表</h2>
                 {% if stop_name %}
-                <p style="font-size: 18px; color: #555; margin-bottom: 16px;">📍 站点：{{ stop_name }}</p>
+                <p style="font-size:18px;color:#555;margin-bottom:16px;">📍 {{ stop_name }}</p>
                 {% endif %}
-                <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-                    <a href="/timetable?route_id={{ route.route_id }}&day=weekday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center;">
+                <div style="display:flex;gap:12px;flex-wrap:wrap;">
+                    <a href="/timetable?route_id={{ route.route_id }}&day=weekday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="search-button" style="display:inline-block;text-decoration:none;flex:1;min-width:120px;text-align:center;">
                         工作日
                     </a>
-                    <a href="/timetable?route_id={{ route.route_id }}&day=saturday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center; background: #F37021;">
+                    <a href="/timetable?route_id={{ route.route_id }}&day=saturday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="search-button" style="display:inline-block;text-decoration:none;flex:1;min-width:120px;text-align:center;background:#F37021;">
                         周六
                     </a>
-                    <a href="/timetable?route_id={{ route.route_id }}&day=sunday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}" class="search-button" style="display: inline-block; text-decoration: none; flex: 1; min-width: 120px; text-align: center; background: #28A745;">
+                    <a href="/timetable?route_id={{ route.route_id }}&day=sunday{% if stop_id %}&stop_id={{ stop_id }}{% endif %}"
+                       class="search-button" style="display:inline-block;text-decoration:none;flex:1;min-width:120px;text-align:center;background:#28A745;">
                         周日
                     </a>
                 </div>
@@ -89,46 +118,18 @@
     </div>
 
     <style>
-        .direction-name {
-            font-size: 20px;
-            color: #F37021;
-            font-weight: 600;
-            margin-top: 8px;
-        }
-
-        .next-bus-list {
-            display: flex;
-            flex-direction: column;
-            gap: 12px;
-        }
-
+        .next-bus-list { display:flex; flex-direction:column; gap:12px; }
         .next-bus-item {
-            display: flex;
-            align-items: center;
-            gap: 16px;
-            padding: 16px;
-            background: #E6F0FF;
-            border-radius: 12px;
-            border-left: 4px solid #0055A4;
+            display:flex; align-items:center; gap:16px;
+            padding:16px; background:#E6F0FF;
+            border-radius:12px; border-left:4px solid #0055A4;
         }
-
         .next-bus-time {
-            font-size: 32px;
-            font-weight: 700;
-            color: #0055A4;
-            min-width: 100px;
-            text-align: center;
+            font-size:32px; font-weight:700; color:#0055A4;
+            min-width:100px; text-align:center;
         }
-
-        .next-bus-info {
-            flex: 1;
-        }
-
-        .next-bus-stop {
-            font-size: 18px;
-            font-weight: 600;
-            color: #1A1A1A;
-        }
+        .next-bus-info { flex:1; }
+        .next-bus-stop { font-size:18px; font-weight:600; color:#1A1A1A; }
     </style>
 </body>
 </html>
