@@ -181,22 +181,31 @@ def direction_detail():
     if not route:
         return render_template('error.html', message=f"未找到路线 {route_id}"), 404
 
-    departures = _get_next_departures(gtfs, route_id, direction)
-    stops = gtfs.get_direction_stops(route_id, direction)
-
     stop_name = ''
     if stop_id:
         stop = gtfs.get_stop_by_id(stop_id)
         if stop:
             stop_name = stop['stop_name']
 
-    return render_template('direction.html',
-                           route=route,
-                           departures=departures,
-                           stops=stops,
-                           direction=direction,
-                           stop_id=stop_id,
-                           stop_name=stop_name)
+    if stop_id:
+        service_ids = gtfs.get_active_service_ids(_today())
+        directions = gtfs.get_next_by_direction(route_id, stop_id, service_ids, _current_secs())
+        return render_template('direction.html',
+                               route=route,
+                               directions=directions,
+                               stop_id=stop_id,
+                               stop_name=stop_name,
+                               direction=direction)
+    else:
+        departures = _get_next_departures(gtfs, route_id, direction)
+        stops = gtfs.get_direction_stops(route_id, direction)
+        return render_template('direction.html',
+                               route=route,
+                               departures=departures,
+                               stops=stops,
+                               direction=direction,
+                               stop_id='',
+                               stop_name='')
 
 
 def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> list[dict]:
