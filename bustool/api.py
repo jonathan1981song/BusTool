@@ -435,6 +435,28 @@ class GTFSData:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_next_by_direction(
+        self, route_id: str, stop_id: str, service_ids: set[str], after_secs: int
+    ) -> list[dict]:
+        """Next departures from stop_id for route_id, grouped by headsign (up to 5 each)."""
+        if not service_ids:
+            return []
+        from collections import defaultdict
+        ph = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.dep_secs "
+            f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"WHERE t.route_id=? AND st.stop_id=? AND st.dep_secs>? AND t.service_id IN ({ph}) "
+            f"ORDER BY st.dep_secs",
+            (route_id, stop_id, after_secs, *service_ids)
+        ).fetchall()
+        d: dict = defaultdict(list)
+        for r in rows:
+            s = r[1]
+            if len(d[r[0]]) < 5:
+                d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
+        return [{"headsign": h, "times": times} for h, times in d.items()]
+
     # ------------------------------------------------------------------ #
     # Timetable queries
     # ------------------------------------------------------------------ #
