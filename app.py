@@ -7,7 +7,15 @@ Flask web application for Brisbane bus timetable lookup.
 import os
 import socket
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
+
+_BRISBANE = timezone(timedelta(hours=10))
+
+def _now() -> datetime:
+    return datetime.now(_BRISBANE)
+
+def _today() -> date:
+    return _now().date()
 
 from flask import Flask, render_template, request, jsonify
 
@@ -42,7 +50,7 @@ def get_gtfs() -> GTFSData:
 
 
 def _current_secs() -> int:
-    now = datetime.now()
+    now = _now()
     return now.hour * 3600 + now.minute * 60 + now.second
 
 
@@ -192,7 +200,7 @@ def direction_detail():
 
 
 def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> list[dict]:
-    service_ids = gtfs.get_active_service_ids(date.today())
+    service_ids = gtfs.get_active_service_ids(_today())
     after_secs  = _current_secs()
     rows = gtfs.get_next_departures(route_id, service_ids, after_secs, direction)
     result = []
@@ -232,7 +240,7 @@ def nearby_routes():
     radius_m = float(request.args.get('radius', 500))
     gtfs = get_gtfs()
 
-    today      = date.today()
+    today      = _today()
     now_secs   = _current_secs()
 
     nearby = gtfs.get_stops_near(lat, lon, radius_m)
