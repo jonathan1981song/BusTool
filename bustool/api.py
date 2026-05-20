@@ -16,7 +16,9 @@ import sqlite3
 import threading
 import urllib.request
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
+
+_BRISBANE = timezone(timedelta(hours=10))
 from pathlib import Path
 
 GTFS_URL = "https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip"
@@ -547,9 +549,9 @@ class GTFSData:
         if stop is None:
             raise ValueError(f"Stop code '{stop_code}' not found.")
         if on_date is None:
-            on_date = date.today()
+            on_date = datetime.now(_BRISBANE).date()
         if after_time is None:
-            now = datetime.now()
+            now = datetime.now(_BRISBANE)
             after_time = now.hour * 3600 + now.minute * 60 + now.second
         service_ids = self.get_active_service_ids(on_date)
         if not service_ids:
