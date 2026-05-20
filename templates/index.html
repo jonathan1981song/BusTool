@@ -176,6 +176,9 @@
                             ${r.next_headsign
                                 ? `<div class="nearby-route-headsign">→ ${escapeHtml(r.next_headsign)}</div>`
                                 : ''}
+                            ${r.nearest_stop_zh
+                                ? `<div style="font-size:13px;color:#888;margin-top:2px;">${escapeHtml(r.nearest_stop_zh)}</div>`
+                                : ''}
                         </div>
                         <div class="nearby-route-time${hasTime ? '' : ' no-service'}">${escapeHtml(time)}</div>
                     </a>`;
