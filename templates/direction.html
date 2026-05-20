@@ -23,6 +23,9 @@
                         <h2>{{ route.route_long_name }}</h2>
                         {% if stop_name %}
                         <p style="font-size:17px;color:#555;margin-top:6px;">📍 {{ stop_name }}</p>
+                        {% if stop_name|translate_stop %}
+                        <p style="font-size:15px;color:#888;margin-top:2px;">{{ stop_name|translate_stop }}</p>
+                        {% endif %}
                         {% endif %}
                     </div>
                 </div>
@@ -33,7 +36,10 @@
                 {% if directions %}
                     {% for d in directions %}
                     <section class="timetable-section" style="margin-bottom:16px;">
-                        <h2 style="font-size:20px;color:#F37021;margin-bottom:12px;">→ {{ d.headsign }}</h2>
+                        <h2 style="font-size:20px;color:#F37021;margin-bottom:4px;">→ {{ d.headsign }}</h2>
+                        {% if d.headsign|translate_stop %}
+                        <p style="font-size:15px;color:#888;margin-bottom:10px;">{{ d.headsign|translate_stop }}</p>
+                        {% endif %}
                         <div class="next-bus-list">
                             {% for t in d.times %}
                             <div class="next-bus-item">
