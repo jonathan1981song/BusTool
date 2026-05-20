@@ -20,8 +20,10 @@ def _today() -> date:
 from flask import Flask, render_template, request, jsonify
 
 from bustool.api import GTFSData, _haversine_m
+from bustool.translations import translate_stop
 
 app = Flask(__name__)
+app.jinja_env.filters['translate_stop'] = translate_stop
 
 _gtfs_data = None
 _gtfs_ready = threading.Event()
@@ -292,6 +294,7 @@ def nearby_routes():
             'route_long_name':   long,
             'nearest_stop_id':   stop_id,
             'nearest_stop_name': stop['stop_name'] if stop else stop_id,
+            'nearest_stop_zh':   translate_stop(stop['stop_name']) if stop else '',
             'distance_m':        round(dist),
             'next_departure':    f"{(dep_secs // 3600) % 24:02d}:{(dep_secs % 3600) // 60:02d}",
             'next_headsign':     headsign,
@@ -305,6 +308,7 @@ def nearby_routes():
             'route_long_name':   long,
             'nearest_stop_id':   stop_id,
             'nearest_stop_name': stop['stop_name'] if stop else stop_id,
+            'nearest_stop_zh':   translate_stop(stop['stop_name']) if stop else '',
             'distance_m':        round(dist),
             'next_departure':    None,
             'next_headsign':     '',
