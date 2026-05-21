@@ -175,6 +175,13 @@ def direction_detail():
     direction = request.args.get('direction', '').strip()
     stop_id   = request.args.get('stop_id', '')
 
+    try:
+        lat = float(request.args.get('lat', ''))
+        lon = float(request.args.get('lon', ''))
+        has_location = True
+    except ValueError:
+        has_location = False
+
     if not route_id:
         return render_template('error.html', message="请输入路线编号"), 400
 
@@ -189,9 +196,17 @@ def direction_detail():
         if stop:
             stop_name = stop['stop_name']
 
-    if stop_id:
+    if has_location or stop_id:
         service_ids = gtfs.get_active_service_ids(_today())
-        directions = gtfs.get_next_by_direction(route_id, stop_id, service_ids, _current_secs())
+        if has_location:
+            nearby = gtfs.get_stops_near(lat, lon, 500)
+            route_stop_ids = gtfs.get_route_stop_ids(route_id)
+            relevant = [sid for sid, _ in nearby if sid in route_stop_ids]
+            if not relevant and stop_id:
+                relevant = [stop_id]
+            directions = gtfs.get_next_by_direction_multi(route_id, relevant, service_ids, _current_secs())
+        else:
+            directions = gtfs.get_next_by_direction(route_id, stop_id, service_ids, _current_secs())
         return render_template('direction.html',
                                route=route,
                                directions=directions,
