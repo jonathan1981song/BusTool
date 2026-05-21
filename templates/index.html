@@ -180,7 +180,7 @@
                 const dirParam = r.next_headsign
                     ? `&direction=${encodeURIComponent(r.next_headsign)}` : '';
                 return `
-                    <a href="/direction?route_id=${encodeURIComponent(r.route_id)}${dirParam}&stop_id=${encodeURIComponent(r.nearest_stop_id)}"
+                    <a href="/direction?route_id=${encodeURIComponent(r.route_id)}&stop_id=${encodeURIComponent(r.nearest_stop_id)}&lat=${savedLat}&lon=${savedLon}"
                        class="nearby-route-card">
                         <div class="nearby-route-number">${escapeHtml(r.route_short_name)}</div>
                         <div class="nearby-route-info">
@@ -262,19 +262,30 @@
 
         function openRoute(routeId) {
             if (savedLat !== null) {
-                fetch(`/nearest_stop?route_id=${encodeURIComponent(routeId)}&lat=${savedLat}&lon=${savedLon}`)
-                    .then(r => r.json())
-                    .then(data => {
-                        if (data.stop_id) {
-                            location.href = `/direction?route_id=${encodeURIComponent(routeId)}&stop_id=${encodeURIComponent(data.stop_id)}`;
-                        } else {
-                            location.href = `/route/${encodeURIComponent(routeId)}`;
-                        }
-                    })
-                    .catch(() => { location.href = `/route/${encodeURIComponent(routeId)}`; });
+                goToNearestStop(routeId, savedLat, savedLon);
+            } else if ('geolocation' in navigator && window.isSecureContext) {
+                navigator.geolocation.getCurrentPosition(
+                    pos => {
+                        savedLat = pos.coords.latitude;
+                        savedLon = pos.coords.longitude;
+                        goToNearestStop(routeId, savedLat, savedLon);
+                    },
+                    () => { location.href = `/route/${encodeURIComponent(routeId)}`; },
+                    { timeout: 8000 }
+                );
             } else {
                 location.href = `/route/${encodeURIComponent(routeId)}`;
             }
+        }
+
+        function goToNearestStop(routeId, lat, lon) {
+            fetch(`/nearest_stop?route_id=${encodeURIComponent(routeId)}&lat=${lat}&lon=${lon}`)
+                .then(r => r.json())
+                .then(data => {
+                    const stopParam = data.stop_id ? `&stop_id=${encodeURIComponent(data.stop_id)}` : '';
+                    location.href = `/direction?route_id=${encodeURIComponent(routeId)}${stopParam}&lat=${lat}&lon=${lon}`;
+                })
+                .catch(() => { location.href = `/route/${encodeURIComponent(routeId)}`; });
         }
 
         // ── Helpers ───────────────────────────────────────────────
