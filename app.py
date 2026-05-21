@@ -231,6 +231,23 @@ def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> 
     return result[:20]
 
 
+@app.route('/nearest_stop')
+def nearest_stop():
+    route_id = request.args.get('route_id', '')
+    try:
+        lat = float(request.args.get('lat', ''))
+        lon = float(request.args.get('lon', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid coordinates'}), 400
+    if not route_id:
+        return jsonify({'error': 'No route_id'}), 400
+    stops = get_gtfs().get_route_all_stops(route_id)
+    if not stops:
+        return jsonify({'stop_id': None})
+    nearest = min(stops, key=lambda s: _haversine_m(lat, lon, s['stop_lat'], s['stop_lon']))
+    return jsonify({'stop_id': nearest['stop_id']})
+
+
 @app.route('/route_stops')
 def route_stops():
     route_id = request.args.get('route_id', '')
