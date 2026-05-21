@@ -250,20 +250,22 @@
                         return;
                     }
                     list.innerHTML = routes.map(r =>
-                        `<button class="stop-result-item"
-                             style="width:100%;text-align:left;background:none;border:none;cursor:pointer;"
-                             onclick="openRoute(${JSON.stringify(r.route_id)})">
+                        `<a href="/route/${encodeURIComponent(r.route_id)}"
+                            class="stop-result-item" style="display:block;text-decoration:none;"
+                            onclick="openRoute(event, ${JSON.stringify(r.route_id)})">
                              <strong>${escapeHtml(r.route_short_name)}</strong>
                              &nbsp;${escapeHtml(r.route_long_name)}
-                         </button>`
+                         </a>`
                     ).join('');
                 });
         }
 
-        function openRoute(routeId) {
+        function openRoute(event, routeId) {
+            event.preventDefault();
             if (savedLat !== null) {
                 goToNearestStop(routeId, savedLat, savedLon);
             } else if ('geolocation' in navigator && window.isSecureContext) {
+                event.target.textContent = '📍 正在获取位置…';
                 navigator.geolocation.getCurrentPosition(
                     pos => {
                         savedLat = pos.coords.latitude;
