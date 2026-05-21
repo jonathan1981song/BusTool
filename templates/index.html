@@ -250,13 +250,31 @@
                         return;
                     }
                     list.innerHTML = routes.map(r =>
-                        `<a href="/route/${encodeURIComponent(r.route_id)}"
-                            class="stop-result-item" style="display:block;text-decoration:none;">
+                        `<button class="stop-result-item"
+                             style="width:100%;text-align:left;background:none;border:none;cursor:pointer;"
+                             onclick="openRoute(${JSON.stringify(r.route_id)})">
                              <strong>${escapeHtml(r.route_short_name)}</strong>
                              &nbsp;${escapeHtml(r.route_long_name)}
-                         </a>`
+                         </button>`
                     ).join('');
                 });
+        }
+
+        function openRoute(routeId) {
+            if (savedLat !== null) {
+                fetch(`/nearest_stop?route_id=${encodeURIComponent(routeId)}&lat=${savedLat}&lon=${savedLon}`)
+                    .then(r => r.json())
+                    .then(data => {
+                        if (data.stop_id) {
+                            location.href = `/direction?route_id=${encodeURIComponent(routeId)}&stop_id=${encodeURIComponent(data.stop_id)}`;
+                        } else {
+                            location.href = `/route/${encodeURIComponent(routeId)}`;
+                        }
+                    })
+                    .catch(() => { location.href = `/route/${encodeURIComponent(routeId)}`; });
+            } else {
+                location.href = `/route/${encodeURIComponent(routeId)}`;
+            }
         }
 
         // ── Helpers ───────────────────────────────────────────────
