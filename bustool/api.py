@@ -28,11 +28,6 @@ _DB_PATH  = _DATA_DIR / "gtfs.db"
 _CACHE_MAX_AGE_HOURS = 24
 _DOW = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
 
-# Only load routes that serve these suburbs — keeps the DB small enough for free hosting.
-SUBURB_FILTER = [
-    "indooroopilly", "taringa", "st lucia", "toowong",
-    "auchenflower", "chelmer", "graceville", "sherwood",
-]
 
 
 def _read_csv(z: zipfile.ZipFile, name: str) -> list[dict]:
@@ -143,28 +138,8 @@ class GTFSData:
         """)
 
         with zipfile.ZipFile(_ZIP_PATH) as z:
-            # Step 1: load all stops; find which stop_ids are in target suburbs
+            # Stops (small — load all at once)
             all_stops = _read_csv(z, "stops.txt")
-            target_stop_ids = {
-                r["stop_id"] for r in all_stops
-                if any(kw in r["stop_name"].lower() for kw in SUBURB_FILTER)
-            }
-            print(f"  target suburb stops: {len(target_stop_ids)}", flush=True)
-
-            # Step 2: first pass over stop_times — find trip_ids that serve target suburbs
-            relevant_trip_ids: set[str] = set()
-            with z.open("stop_times.txt") as f:
-                for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
-                    if row["stop_id"] in target_stop_ids:
-                        relevant_trip_ids.add(row["trip_id"])
-            print(f"  relevant trips: {len(relevant_trip_ids)}", flush=True)
-
-            # Step 3: filter trips and collect route_ids
-            all_trips = _read_csv(z, "trips.txt")
-            filtered_trips = [r for r in all_trips if r["trip_id"] in relevant_trip_ids]
-            relevant_route_ids = {r["route_id"] for r in filtered_trips}
-
-            # Step 4: insert stops (all of them — small file, needed for full route display)
             conn.executemany("INSERT INTO stops VALUES (?,?,?,?,?)", [
                 (r["stop_id"], r.get("stop_code", ""), r["stop_name"],
                  float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0))
@@ -172,50 +147,55 @@ class GTFSData:
             ])
             print(f"  stops: {len(all_stops)}", flush=True)
 
-            # Step 5: insert filtered routes
+            # Routes (small — load all at once)
             all_routes = _read_csv(z, "routes.txt")
-            filtered_routes = [r for r in all_routes if r["route_id"] in relevant_route_ids]
             conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
                 (r["route_id"], r["route_short_name"], r["route_long_name"])
-                for r in filtered_routes
+                for r in all_routes
             ])
-            print(f"  routes: {len(filtered_routes)} (of {len(all_routes)})", flush=True)
+            print(f"  routes: {len(all_routes)}", flush=True)
 
-            # Step 6: insert filtered trips
-            conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", [
-                (r["trip_id"], r["route_id"], r["service_id"], r.get("trip_headsign", ""))
-                for r in filtered_trips
-            ])
-            print(f"  trips: {len(filtered_trips)} (of {len(all_trips)})", flush=True)
-
-            # Step 7: second pass over stop_times — insert only relevant trips
-            count = 0
-            with z.open("stop_times.txt") as f:
+            # Trips (stream in batches to keep RAM low)
+            trip_count = 0
+            with z.open("trips.txt") as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
                 batch: list = []
                 for row in reader:
-                    if row["trip_id"] not in relevant_trip_ids:
-                        continue
+                    batch.append((row["trip_id"], row["route_id"],
+                                  row["service_id"], row.get("trip_headsign", "")))
+                    if len(batch) >= 50_000:
+                        conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", batch)
+                        trip_count += len(batch)
+                        batch.clear()
+                if batch:
+                    conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", batch)
+                    trip_count += len(batch)
+            print(f"  trips: {trip_count}", flush=True)
+
+            # Stop times (stream in batches)
+            st_count = 0
+            with z.open("stop_times.txt") as f:
+                reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
+                batch = []
+                for row in reader:
                     dep = row["departure_time"]
                     try:
                         h, m, s = dep.split(":")
                         secs = int(h) * 3600 + int(m) * 60 + int(s)
                     except Exception:
                         secs = 0
-                    batch.append((
-                        row["trip_id"], row["stop_id"],
-                        secs, int(row["stop_sequence"]),
-                    ))
+                    batch.append((row["trip_id"], row["stop_id"],
+                                  secs, int(row["stop_sequence"])))
                     if len(batch) >= 50_000:
                         conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
-                        count += len(batch)
+                        st_count += len(batch)
                         batch.clear()
                 if batch:
                     conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
-                    count += len(batch)
-            print(f"  stop_times: {count} (filtered)", flush=True)
+                    st_count += len(batch)
+            print(f"  stop_times: {st_count}", flush=True)
 
-            # Calendar stays unfiltered (small files)
+            # Calendar (small)
             rows = _read_csv(z, "calendar.txt")
             conn.executemany("INSERT INTO calendar VALUES (?,?,?,?,?,?,?,?,?,?)", [
                 (r["service_id"],
@@ -434,6 +414,38 @@ class GTFSData:
             stop_ids
         ).fetchall()
         return [dict(r) for r in rows]
+
+    def get_route_stop_ids(self, route_id: str) -> set[str]:
+        rows = self._conn().execute(
+            "SELECT DISTINCT st.stop_id FROM trips t "
+            "JOIN stop_times st ON t.trip_id=st.trip_id "
+            "WHERE t.route_id=?",
+            (route_id,)
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_next_by_direction_multi(
+        self, route_id: str, stop_ids: list[str], service_ids: set[str], after_secs: int
+    ) -> list[dict]:
+        """Next departures from any of stop_ids, grouped by headsign (up to 5 each)."""
+        if not service_ids or not stop_ids:
+            return []
+        from collections import defaultdict
+        ph_s = ",".join("?" * len(stop_ids))
+        ph_v = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.dep_secs "
+            f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"WHERE t.route_id=? AND st.stop_id IN ({ph_s}) AND st.dep_secs>? AND t.service_id IN ({ph_v}) "
+            f"ORDER BY st.dep_secs",
+            (route_id, *stop_ids, after_secs, *service_ids)
+        ).fetchall()
+        d: dict = defaultdict(list)
+        for r in rows:
+            s = r[1]
+            if len(d[r[0]]) < 5:
+                d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
+        return [{"headsign": h, "times": times} for h, times in d.items()]
 
     def get_next_by_direction(
         self, route_id: str, stop_id: str, service_ids: set[str], after_secs: int
