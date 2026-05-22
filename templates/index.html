@@ -263,14 +263,14 @@
         function openRoute(event, routeId) {
             event.preventDefault();
             if (savedLat !== null) {
-                goToNearestStop(routeId, savedLat, savedLon);
+                location.href = `/direction?route_id=${encodeURIComponent(routeId)}&lat=${savedLat}&lon=${savedLon}`;
             } else if ('geolocation' in navigator && window.isSecureContext) {
-                event.target.textContent = '📍 正在获取位置…';
+                event.currentTarget.innerHTML = '📍 正在获取位置…';
                 navigator.geolocation.getCurrentPosition(
                     pos => {
                         savedLat = pos.coords.latitude;
                         savedLon = pos.coords.longitude;
-                        goToNearestStop(routeId, savedLat, savedLon);
+                        location.href = `/direction?route_id=${encodeURIComponent(routeId)}&lat=${savedLat}&lon=${savedLon}`;
                     },
                     () => { location.href = `/route/${encodeURIComponent(routeId)}`; },
                     { timeout: 8000 }
@@ -278,16 +278,6 @@
             } else {
                 location.href = `/route/${encodeURIComponent(routeId)}`;
             }
-        }
-
-        function goToNearestStop(routeId, lat, lon) {
-            fetch(`/nearest_stop?route_id=${encodeURIComponent(routeId)}&lat=${lat}&lon=${lon}`)
-                .then(r => r.json())
-                .then(data => {
-                    const stopParam = data.stop_id ? `&stop_id=${encodeURIComponent(data.stop_id)}` : '';
-                    location.href = `/direction?route_id=${encodeURIComponent(routeId)}${stopParam}&lat=${lat}&lon=${lon}`;
-                })
-                .catch(() => { location.href = `/route/${encodeURIComponent(routeId)}`; });
         }
 
         // ── Helpers ───────────────────────────────────────────────
