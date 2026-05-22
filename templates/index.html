@@ -281,7 +281,8 @@
             if (savedLat !== null) {
                 location.href = `/direction?route_id=${encodeURIComponent(routeId)}&lat=${savedLat}&lon=${savedLon}`;
             } else if ('geolocation' in navigator && window.isSecureContext) {
-                event.currentTarget.innerHTML = '📍 正在获取位置…';
+                const link = event.target.closest('a') || event.target;
+                link.innerHTML = '📍 正在获取位置…';
                 navigator.geolocation.getCurrentPosition(
                     pos => {
                         savedLat = pos.coords.latitude;
@@ -295,3 +296,28 @@
                 location.href = `/route/${encodeURIComponent(routeId)}`;
             }
         }
+
+        // ── Helpers ───────────────────────────────────────────────
+        function showError(msg) {
+            detectingSection.style.display = 'none';
+            errorSection.style.display = 'block';
+            document.getElementById('error-text').textContent = msg;
+        }
+
+        function escapeHtml(text) {
+            const d = document.createElement('div');
+            d.textContent = String(text);
+            return d.innerHTML;
+        }
+    </script>
+    <style>
+        .gps-bars { display:inline-flex; align-items:flex-end; gap:2px; vertical-align:middle; margin-right:3px; }
+        .gps-bar  { width:5px; border-radius:1px 1px 0 0; background:#ddd; }
+        .gps-bar.on { background:#0055A4; }
+        .gps-bar:nth-child(1) { height:5px; }
+        .gps-bar:nth-child(2) { height:9px; }
+        .gps-bar:nth-child(3) { height:13px; }
+        .gps-bar:nth-child(4) { height:18px; }
+    </style>
+</body>
+</html>
