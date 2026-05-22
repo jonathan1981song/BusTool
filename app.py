@@ -204,6 +204,12 @@ def direction_detail():
             relevant = [sid for sid, _ in nearby if sid in route_stop_ids]
             if not relevant and stop_id:
                 relevant = [stop_id]
+            # Set nearest stop name for display if not already set
+            if not stop_name and relevant:
+                nearest = gtfs.get_stop_by_id(relevant[0])
+                if nearest:
+                    stop_name = nearest['stop_name']
+                    stop_id = relevant[0]
             directions = gtfs.get_next_by_direction_multi(route_id, relevant, service_ids, _current_secs())
         else:
             directions = gtfs.get_next_by_direction(route_id, stop_id, service_ids, _current_secs())
