@@ -42,7 +42,10 @@
 
             <!-- Nearby routes list -->
             <section id="results-section" style="display:none;">
-                <p id="results-subtitle" style="font-size:16px;color:#666;margin-bottom:14px;"></p>
+                <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;">
+                    <p id="results-subtitle" style="font-size:16px;color:#666;margin:0;"></p>
+                    <span id="gps-signal" style="display:none;font-size:12px;color:#888;white-space:nowrap;margin-left:8px;"></span>
+                </div>
                 <div id="routes-list"></div>
                 <p id="last-updated" style="font-size:13px;color:#999;text-align:center;margin-top:8px;"></p>
             </section>
@@ -92,6 +95,18 @@
 
         let savedLat = null, savedLon = null;
 
+        function showGpsSignal(accuracy) {
+            const bars = accuracy < 20 ? 4 : accuracy < 50 ? 3 : accuracy < 150 ? 2 : 1;
+            let html = '<span class="gps-bars">';
+            for (let i = 1; i <= 4; i++) {
+                html += `<span class="gps-bar${i <= bars ? ' on' : ''}"></span>`;
+            }
+            html += `</span>±${Math.round(accuracy)}m`;
+            const el = document.getElementById('gps-signal');
+            el.innerHTML = html;
+            el.style.display = 'inline';
+        }
+
         // ── Wait for GTFS data to finish loading ─────────────────
         (function checkReady() {
             fetch('/status')
@@ -121,6 +136,7 @@
                     pos => {
                         savedLat = pos.coords.latitude;
                         savedLon = pos.coords.longitude;
+                        showGpsSignal(pos.coords.accuracy);
                         fetchNearbyRoutes(savedLat, savedLon);
                     },
                     () => showStopSearchFallback(),
@@ -279,19 +295,3 @@
                 location.href = `/route/${encodeURIComponent(routeId)}`;
             }
         }
-
-        // ── Helpers ───────────────────────────────────────────────
-        function showError(msg) {
-            detectingSection.style.display = 'none';
-            errorSection.style.display = 'block';
-            document.getElementById('error-text').textContent = msg;
-        }
-
-        function escapeHtml(text) {
-            const d = document.createElement('div');
-            d.textContent = String(text);
-            return d.innerHTML;
-        }
-    </script>
-</body>
-</html>
