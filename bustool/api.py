@@ -16,7 +16,9 @@ import sqlite3
 import threading
 import urllib.request
 import zipfile
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
+
+_BRISBANE = timezone(timedelta(hours=10))
 from pathlib import Path
 
 GTFS_URL = "https://gtfsrt.api.translink.com.au/GTFS/SEQ_GTFS.zip"
@@ -25,6 +27,7 @@ _ZIP_PATH = _DATA_DIR / "SEQ_GTFS.zip"
 _DB_PATH  = _DATA_DIR / "gtfs.db"
 _CACHE_MAX_AGE_HOURS = 24
 _DOW = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+
 
 
 def _read_csv(z: zipfile.ZipFile, name: str) -> list[dict]:
@@ -92,107 +95,129 @@ class GTFSData:
         conn = sqlite3.connect(str(_DB_PATH))
         conn.execute("PRAGMA journal_mode=OFF")
         conn.execute("PRAGMA synchronous=OFF")
+        conn.execute("PRAGMA temp_store=FILE")
+        conn.execute("PRAGMA cache_size=-4000")
 
         conn.executescript("""
             CREATE TABLE stops (
-                stop_id   TEXT PRIMARY KEY,
+                stop_id   TEXT,
                 stop_code TEXT,
                 stop_name TEXT,
                 stop_lat  REAL,
                 stop_lon  REAL
             );
-            CREATE INDEX idx_stops_code ON stops(stop_code);
-
             CREATE TABLE routes (
-                route_id         TEXT PRIMARY KEY,
+                route_id         TEXT,
                 route_short_name TEXT,
                 route_long_name  TEXT
             );
-
             CREATE TABLE trips (
-                trip_id       TEXT PRIMARY KEY,
+                trip_id       TEXT,
                 route_id      TEXT,
                 service_id    TEXT,
                 trip_headsign TEXT
             );
-            CREATE INDEX idx_trips_route ON trips(route_id);
-
             CREATE TABLE stop_times (
-                trip_id        TEXT,
-                stop_id        TEXT,
-                arrival_time   TEXT,
-                departure_time TEXT,
-                dep_secs       INTEGER,
-                stop_sequence  INTEGER
+                trip_id       TEXT,
+                stop_id       TEXT,
+                dep_secs      INTEGER,
+                stop_sequence INTEGER
             );
-            CREATE INDEX idx_st_stop ON stop_times(stop_id, dep_secs);
-            CREATE INDEX idx_st_trip ON stop_times(trip_id, stop_sequence);
-
             CREATE TABLE calendar (
-                service_id TEXT PRIMARY KEY,
+                service_id TEXT,
                 monday     INTEGER, tuesday  INTEGER, wednesday INTEGER,
                 thursday   INTEGER, friday   INTEGER, saturday  INTEGER,
                 sunday     INTEGER,
                 start_date TEXT,    end_date  TEXT
             );
-
             CREATE TABLE calendar_dates (
                 service_id     TEXT,
                 date           TEXT,
                 exception_type INTEGER
             );
-            CREATE INDEX idx_cd ON calendar_dates(service_id, date);
         """)
 
+        # Greater Brisbane bounding box — excludes Gold Coast and Sunshine Coast
+        _LAT_MIN, _LAT_MAX = -27.80, -26.90
+        _LON_MIN, _LON_MAX = 152.60, 153.30
+
         with zipfile.ZipFile(_ZIP_PATH) as z:
-            rows = _read_csv(z, "stops.txt")
+            # Step 1: load all stops; keep those inside the bounding box
+            all_stops = _read_csv(z, "stops.txt")
+            target_stop_ids: set[str] = set()
+            for r in all_stops:
+                try:
+                    lat = float(r.get("stop_lat") or 0)
+                    lon = float(r.get("stop_lon") or 0)
+                except ValueError:
+                    continue
+                if _LAT_MIN <= lat <= _LAT_MAX and _LON_MIN <= lon <= _LON_MAX:
+                    target_stop_ids.add(r["stop_id"])
+            print(f"  stops in Greater Brisbane: {len(target_stop_ids)} / {len(all_stops)}", flush=True)
+
+            # Step 2: first pass over stop_times — find trip_ids that serve target area
+            relevant_trip_ids: set[str] = set()
+            with z.open("stop_times.txt") as f:
+                for row in csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig")):
+                    if row["stop_id"] in target_stop_ids:
+                        relevant_trip_ids.add(row["trip_id"])
+            print(f"  relevant trips: {len(relevant_trip_ids)}", flush=True)
+
+            # Step 3: filter trips; collect route_ids
+            all_trips = _read_csv(z, "trips.txt")
+            filtered_trips = [r for r in all_trips if r["trip_id"] in relevant_trip_ids]
+            relevant_route_ids = {r["route_id"] for r in filtered_trips}
+
+            # Step 4: insert all stops (needed for full route display)
             conn.executemany("INSERT INTO stops VALUES (?,?,?,?,?)", [
                 (r["stop_id"], r.get("stop_code", ""), r["stop_name"],
                  float(r.get("stop_lat") or 0), float(r.get("stop_lon") or 0))
-                for r in rows
+                for r in all_stops
             ])
-            print(f"  stops: {len(rows)}", flush=True)
+            print(f"  stops inserted: {len(all_stops)}", flush=True)
 
-            rows = _read_csv(z, "routes.txt")
+            # Step 5: insert filtered routes
+            all_routes = _read_csv(z, "routes.txt")
+            filtered_routes = [r for r in all_routes if r["route_id"] in relevant_route_ids]
             conn.executemany("INSERT INTO routes VALUES (?,?,?)", [
                 (r["route_id"], r["route_short_name"], r["route_long_name"])
-                for r in rows
+                for r in filtered_routes
             ])
-            print(f"  routes: {len(rows)}", flush=True)
+            print(f"  routes: {len(filtered_routes)} (of {len(all_routes)})", flush=True)
 
-            rows = _read_csv(z, "trips.txt")
+            # Step 6: insert filtered trips
             conn.executemany("INSERT INTO trips VALUES (?,?,?,?)", [
-                (r["trip_id"], r["route_id"], r["service_id"],
-                 r.get("trip_headsign", ""))
-                for r in rows
+                (r["trip_id"], r["route_id"], r["service_id"], r.get("trip_headsign", ""))
+                for r in filtered_trips
             ])
-            print(f"  trips: {len(rows)}", flush=True)
+            print(f"  trips: {len(filtered_trips)} (of {len(all_trips)})", flush=True)
 
-            count = 0
+            # Step 7: second pass over stop_times — insert only relevant trips
+            st_count = 0
             with z.open("stop_times.txt") as f:
                 reader = csv.DictReader(io.TextIOWrapper(f, encoding="utf-8-sig"))
                 batch: list = []
                 for row in reader:
+                    if row["trip_id"] not in relevant_trip_ids:
+                        continue
                     dep = row["departure_time"]
                     try:
                         h, m, s = dep.split(":")
                         secs = int(h) * 3600 + int(m) * 60 + int(s)
                     except Exception:
                         secs = 0
-                    batch.append((
-                        row["trip_id"], row["stop_id"],
-                        row.get("arrival_time", ""), dep, secs,
-                        int(row["stop_sequence"]),
-                    ))
-                    if len(batch) >= 100_000:
-                        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
-                        count += len(batch)
+                    batch.append((row["trip_id"], row["stop_id"],
+                                  secs, int(row["stop_sequence"])))
+                    if len(batch) >= 50_000:
+                        conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
+                        st_count += len(batch)
                         batch.clear()
                 if batch:
-                    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?,?,?)", batch)
-                    count += len(batch)
-            print(f"  stop_times: {count}", flush=True)
+                    conn.executemany("INSERT INTO stop_times VALUES (?,?,?,?)", batch)
+                    st_count += len(batch)
+            print(f"  stop_times: {st_count} (filtered)", flush=True)
 
+            # Calendar (small)
             rows = _read_csv(z, "calendar.txt")
             conn.executemany("INSERT INTO calendar VALUES (?,?,?,?,?,?,?,?,?,?)", [
                 (r["service_id"],
@@ -210,6 +235,14 @@ class GTFSData:
                 for r in rows
             ])
 
+        print("  Building indexes…", flush=True)
+        conn.executescript("""
+            CREATE INDEX idx_stops_code ON stops(stop_code);
+            CREATE INDEX idx_trips_route ON trips(route_id);
+            CREATE INDEX idx_st_stop ON stop_times(stop_id, dep_secs);
+            CREATE INDEX idx_st_trip ON stop_times(trip_id, stop_sequence);
+            CREATE INDEX idx_cd ON calendar_dates(service_id, date);
+        """)
         conn.commit()
         conn.close()
 
@@ -345,7 +378,7 @@ class GTFSData:
         c = self._conn()
         if direction:
             rows = c.execute(
-                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"SELECT DISTINCT st.dep_secs, t.trip_headsign, "
                 f"       st.stop_id, s.stop_name, s.stop_code "
                 f"FROM trips t "
                 f"JOIN stop_times st ON t.trip_id=st.trip_id "
@@ -357,7 +390,7 @@ class GTFSData:
             ).fetchall()
         else:
             rows = c.execute(
-                f"SELECT DISTINCT st.dep_secs, st.departure_time, t.trip_headsign, "
+                f"SELECT DISTINCT st.dep_secs, t.trip_headsign, "
                 f"       st.stop_id, s.stop_name, s.stop_code "
                 f"FROM trips t "
                 f"JOIN stop_times st ON t.trip_id=st.trip_id "
@@ -404,6 +437,60 @@ class GTFSData:
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_route_stop_ids(self, route_id: str) -> set[str]:
+        rows = self._conn().execute(
+            "SELECT DISTINCT st.stop_id FROM trips t "
+            "JOIN stop_times st ON t.trip_id=st.trip_id "
+            "WHERE t.route_id=?",
+            (route_id,)
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def get_next_by_direction_multi(
+        self, route_id: str, stop_ids: list[str], service_ids: set[str], after_secs: int
+    ) -> list[dict]:
+        """Next departures from any of stop_ids, grouped by headsign (up to 5 each)."""
+        if not service_ids or not stop_ids:
+            return []
+        from collections import defaultdict
+        ph_s = ",".join("?" * len(stop_ids))
+        ph_v = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.dep_secs "
+            f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"WHERE t.route_id=? AND st.stop_id IN ({ph_s}) AND st.dep_secs>? AND t.service_id IN ({ph_v}) "
+            f"ORDER BY st.dep_secs",
+            (route_id, *stop_ids, after_secs, *service_ids)
+        ).fetchall()
+        d: dict = defaultdict(list)
+        for r in rows:
+            s = r[1]
+            if len(d[r[0]]) < 5:
+                d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
+        return [{"headsign": h, "times": times} for h, times in d.items()]
+
+    def get_next_by_direction(
+        self, route_id: str, stop_id: str, service_ids: set[str], after_secs: int
+    ) -> list[dict]:
+        """Next departures from stop_id for route_id, grouped by headsign (up to 5 each)."""
+        if not service_ids:
+            return []
+        from collections import defaultdict
+        ph = ",".join("?" * len(service_ids))
+        rows = self._conn().execute(
+            f"SELECT t.trip_headsign, st.dep_secs "
+            f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
+            f"WHERE t.route_id=? AND st.stop_id=? AND st.dep_secs>? AND t.service_id IN ({ph}) "
+            f"ORDER BY st.dep_secs",
+            (route_id, stop_id, after_secs, *service_ids)
+        ).fetchall()
+        d: dict = defaultdict(list)
+        for r in rows:
+            s = r[1]
+            if len(d[r[0]]) < 5:
+                d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
+        return [{"headsign": h, "times": times} for h, times in d.items()]
+
     # ------------------------------------------------------------------ #
     # Timetable queries
     # ------------------------------------------------------------------ #
@@ -416,15 +503,16 @@ class GTFSData:
         from collections import defaultdict
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT t.trip_headsign, st.departure_time "
+            f"SELECT t.trip_headsign, st.dep_secs "
             f"FROM trips t JOIN stop_times st ON t.trip_id=st.trip_id "
             f"WHERE t.route_id=? AND st.stop_id=? AND t.service_id IN ({ph}) "
-            f"ORDER BY st.departure_time",
+            f"ORDER BY st.dep_secs",
             (route_id, stop_id, *service_ids)
         ).fetchall()
         d: dict = defaultdict(list)
         for r in rows:
-            d[r[0]].append(r[1])
+            s = r[1]
+            d[r[0]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
         return [{"headsign": h, "times": times} for h, times in d.items()]
 
     def get_timetable_origin(
@@ -435,7 +523,7 @@ class GTFSData:
         from collections import defaultdict
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT t.trip_headsign, st.stop_id, s.stop_name, st.departure_time "
+            f"SELECT t.trip_headsign, st.stop_id, s.stop_name, st.dep_secs "
             f"FROM trips t "
             f"JOIN stop_times st ON t.trip_id=st.trip_id "
             f"JOIN stops s ON st.stop_id=s.stop_id "
@@ -443,13 +531,14 @@ class GTFSData:
             f"  AND st.stop_sequence=("
             f"    SELECT MIN(s2.stop_sequence) FROM stop_times s2 WHERE s2.trip_id=t.trip_id"
             f"  ) "
-            f"ORDER BY st.departure_time",
+            f"ORDER BY st.dep_secs",
             (route_id, *service_ids)
         ).fetchall()
         data: dict = defaultdict(lambda: defaultdict(list))
         stop_names: dict = {}
         for r in rows:
-            data[r["trip_headsign"]][r["stop_id"]].append(r["departure_time"])
+            s = r["dep_secs"]
+            data[r["trip_headsign"]][r["stop_id"]].append(f"{s//3600:02d}:{(s%3600)//60:02d}")
             stop_names[r["stop_id"]] = r["stop_name"]
         result = []
         for headsign, stops in data.items():
@@ -516,16 +605,16 @@ class GTFSData:
         if stop is None:
             raise ValueError(f"Stop code '{stop_code}' not found.")
         if on_date is None:
-            on_date = date.today()
+            on_date = datetime.now(_BRISBANE).date()
         if after_time is None:
-            now = datetime.now()
+            now = datetime.now(_BRISBANE)
             after_time = now.hour * 3600 + now.minute * 60 + now.second
         service_ids = self.get_active_service_ids(on_date)
         if not service_ids:
             return []
         ph = ",".join("?" * len(service_ids))
         rows = self._conn().execute(
-            f"SELECT st.departure_time, t.trip_headsign, r.route_short_name "
+            f"SELECT st.dep_secs, t.trip_headsign, r.route_short_name "
             f"FROM stop_times st "
             f"JOIN trips t ON st.trip_id=t.trip_id "
             f"JOIN routes r ON t.route_id=r.route_id "
@@ -536,6 +625,6 @@ class GTFSData:
         return [{
             "route":     r["route_short_name"],
             "headsign":  r["trip_headsign"],
-            "departure": r["departure_time"][:5],
+            "departure": f"{r['dep_secs']//3600:02d}:{(r['dep_secs']%3600)//60:02d}",
             "stop_code": stop_code,
         } for r in rows]

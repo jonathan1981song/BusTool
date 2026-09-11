@@ -7,13 +7,23 @@ Flask web application for Brisbane bus timetable lookup.
 import os
 import socket
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timezone, timedelta
+
+_BRISBANE = timezone(timedelta(hours=10))
+
+def _now() -> datetime:
+    return datetime.now(_BRISBANE)
+
+def _today() -> date:
+    return _now().date()
 
 from flask import Flask, render_template, request, jsonify
 
 from bustool.api import GTFSData, _haversine_m
+from bustool.translations import translate_stop
 
 app = Flask(__name__)
+app.jinja_env.filters['translate_stop'] = translate_stop
 
 _gtfs_data = None
 _gtfs_ready = threading.Event()
@@ -42,7 +52,7 @@ def get_gtfs() -> GTFSData:
 
 
 def _current_secs() -> int:
-    now = datetime.now()
+    now = _now()
     return now.hour * 3600 + now.minute * 60 + now.second
 
 
@@ -165,6 +175,13 @@ def direction_detail():
     direction = request.args.get('direction', '').strip()
     stop_id   = request.args.get('stop_id', '')
 
+    try:
+        lat = float(request.args.get('lat', ''))
+        lon = float(request.args.get('lon', ''))
+        has_location = True
+    except ValueError:
+        has_location = False
+
     if not route_id:
         return render_template('error.html', message="请输入路线编号"), 400
 
@@ -173,32 +190,55 @@ def direction_detail():
     if not route:
         return render_template('error.html', message=f"未找到路线 {route_id}"), 404
 
-    departures = _get_next_departures(gtfs, route_id, direction)
-    stops = gtfs.get_direction_stops(route_id, direction)
-
     stop_name = ''
     if stop_id:
         stop = gtfs.get_stop_by_id(stop_id)
         if stop:
             stop_name = stop['stop_name']
 
-    return render_template('direction.html',
-                           route=route,
-                           departures=departures,
-                           stops=stops,
-                           direction=direction,
-                           stop_id=stop_id,
-                           stop_name=stop_name)
+    if has_location or stop_id:
+        service_ids = gtfs.get_active_service_ids(_today())
+        if has_location:
+            nearby = gtfs.get_stops_near(lat, lon, 500)
+            route_stop_ids = gtfs.get_route_stop_ids(route_id)
+            relevant = [sid for sid, _ in nearby if sid in route_stop_ids]
+            if not relevant and stop_id:
+                relevant = [stop_id]
+            # Set nearest stop name for display if not already set
+            if not stop_name and relevant:
+                nearest = gtfs.get_stop_by_id(relevant[0])
+                if nearest:
+                    stop_name = nearest['stop_name']
+                    stop_id = relevant[0]
+            directions = gtfs.get_next_by_direction_multi(route_id, relevant, service_ids, _current_secs())
+        else:
+            directions = gtfs.get_next_by_direction(route_id, stop_id, service_ids, _current_secs())
+        return render_template('direction.html',
+                               route=route,
+                               directions=directions,
+                               stop_id=stop_id,
+                               stop_name=stop_name,
+                               direction=direction)
+    else:
+        departures = _get_next_departures(gtfs, route_id, direction)
+        stops = gtfs.get_direction_stops(route_id, direction)
+        return render_template('direction.html',
+                               route=route,
+                               departures=departures,
+                               stops=stops,
+                               direction=direction,
+                               stop_id='',
+                               stop_name='')
 
 
 def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> list[dict]:
-    service_ids = gtfs.get_active_service_ids(date.today())
+    service_ids = gtfs.get_active_service_ids(_today())
     after_secs  = _current_secs()
     rows = gtfs.get_next_departures(route_id, service_ids, after_secs, direction)
     result = []
     seen: set = set()
     for r in rows:
-        key = f"{r['stop_id']}_{r['departure_time']}"
+        key = f"{r['stop_id']}_{r['dep_secs']}"
         if key in seen:
             continue
         seen.add(key)
@@ -210,6 +250,23 @@ def _get_next_departures(gtfs: GTFSData, route_id: str, direction: str = '') -> 
             'stop_code': r['stop_code'],
         })
     return result[:20]
+
+
+@app.route('/nearest_stop')
+def nearest_stop():
+    route_id = request.args.get('route_id', '')
+    try:
+        lat = float(request.args.get('lat', ''))
+        lon = float(request.args.get('lon', ''))
+    except ValueError:
+        return jsonify({'error': 'Invalid coordinates'}), 400
+    if not route_id:
+        return jsonify({'error': 'No route_id'}), 400
+    stops = get_gtfs().get_route_all_stops(route_id)
+    if not stops:
+        return jsonify({'stop_id': None})
+    nearest = min(stops, key=lambda s: _haversine_m(lat, lon, s['stop_lat'], s['stop_lon']))
+    return jsonify({'stop_id': nearest['stop_id']})
 
 
 @app.route('/route_stops')
@@ -232,7 +289,7 @@ def nearby_routes():
     radius_m = float(request.args.get('radius', 500))
     gtfs = get_gtfs()
 
-    today      = date.today()
+    today      = _today()
     now_secs   = _current_secs()
 
     nearby = gtfs.get_stops_near(lat, lon, radius_m)
@@ -275,6 +332,7 @@ def nearby_routes():
             'route_long_name':   long,
             'nearest_stop_id':   stop_id,
             'nearest_stop_name': stop['stop_name'] if stop else stop_id,
+            'nearest_stop_zh':   translate_stop(stop['stop_name']) if stop else '',
             'distance_m':        round(dist),
             'next_departure':    f"{(dep_secs // 3600) % 24:02d}:{(dep_secs % 3600) // 60:02d}",
             'next_headsign':     headsign,
@@ -288,6 +346,7 @@ def nearby_routes():
             'route_long_name':   long,
             'nearest_stop_id':   stop_id,
             'nearest_stop_name': stop['stop_name'] if stop else stop_id,
+            'nearest_stop_zh':   translate_stop(stop['stop_name']) if stop else '',
             'distance_m':        round(dist),
             'next_departure':    None,
             'next_headsign':     '',
